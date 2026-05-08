@@ -68,9 +68,10 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
 
 TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
-BOUNDARY_REVIEW_VERSION = 2
+BOUNDARY_REVIEW_VERSION = 3
 EPISODE_DIGEST_VERSION = 1
-FINAL_QUALITY_VERSION = 1
+FINAL_QUALITY_VERSION = 2
+HIGHLIGHTS_CACHE_VERSION = 2
 
 
 def _norm_words(text: str) -> List[str]:
@@ -622,7 +623,7 @@ def generate_shorts(
 
     stage("GPT clip selection", "ranking story beats by hook, payoff, audio energy, and scene flow")
     highlights_result = read_json(highlights_json)
-    if highlights_result and highlights_result.get("complete"):
+    if highlights_result and highlights_result.get("complete") and highlights_result.get("version") == HIGHLIGHTS_CACHE_VERSION:
         user_log("Candidates ready", f"{len(highlights_result.get('highlights', []))} candidates loaded from cache")
     else:
         if highlights_result and highlights_result.get("batches"):
@@ -640,8 +641,15 @@ def generate_shorts(
             cache_path=highlights_json,
         )
         highlights_result["highlights"] = keep_postable_highlights(
-            score_highlights(highlights_result.get("highlights", []), analysis_map)
+            score_highlights(highlights_result.get("highlights", []), analysis_map),
+            min_score=72,
+            min_ending=60,
+            max_context_risk=88,
+            min_first_3s=55,
+            min_payoff=55,
+            min_shareability=50,
         )
+        highlights_result["version"] = HIGHLIGHTS_CACHE_VERSION
         write_json(highlights_json, highlights_result)
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
@@ -678,7 +686,7 @@ def generate_shorts(
         top = refine_highlight_boundaries_with_llm(transcript, top, call_fast_llm, episode_digest=episode_digest)
         top = _apply_text_anchor_boundaries(top, transcript)
         top = _snap_highlights_to_segments(top, transcript)
-        top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
+        top = _enforce_duration_cap(top, transcript)
         stage("Final quality gate", "checking hooks, duplicates, upload metadata, and render style")
         top = final_quality_review_with_llm(
             transcript,
@@ -690,7 +698,15 @@ def generate_shorts(
             cache_path=final_quality_json,
         )
         top = _snap_highlights_to_segments(top, transcript)
-        top = keep_postable_highlights(_enforce_duration_cap(top, transcript), min_score=82)
+        top = keep_postable_highlights(
+            _enforce_duration_cap(top, transcript),
+            min_score=76,
+            min_ending=68,
+            max_context_risk=85,
+            min_first_3s=58,
+            min_payoff=58,
+            min_shareability=52,
+        )
         write_json(verified_top_json, {
             "highlights": top,
             "quality_limited": len(top) < num_clips,

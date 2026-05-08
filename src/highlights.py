@@ -23,6 +23,8 @@ from .local.session import read_json, write_json
 LLMFn = Callable[[str], str]
 
 MIN_POSTABLE_SCORE = 78
+HIGHLIGHT_SELECTION_VERSION = 2
+FINAL_QUALITY_REVIEW_VERSION = 2
 
 
 CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
@@ -290,7 +292,7 @@ For each kept clip:
 - Provide semantic_key, a short meaning label used to remove duplicate ideas.
 
 Hard quality gate:
-- Keep only clips with viral_score >= 82.
+- Keep only clips with viral_score >= 76.
 - Reject clips with weak first 3 seconds, missing setup, missing payoff, unclear context, duplicated meaning, or ending before the thought lands.
 - If only 2 clips are great, keep 2. If none are great, keep none.
 
@@ -645,6 +647,7 @@ def _write_partial_highlights(cache_path: Optional[str], batches: List[Dict], co
     for batch in sorted(batches, key=lambda item: int(item.get("index", 0) or 0)):
         highlights.extend(batch.get("highlights", []))
     payload = {
+        "version": HIGHLIGHT_SELECTION_VERSION,
         "complete": complete,
         "completed_batches": len(batches),
         "batches": batches,
@@ -830,7 +833,12 @@ def call_highlight_api_from_beats(
     existing = read_json(cache_path) if cache_path else None
     completed_by_index = _partial_batches(existing)
     completed_batches = [completed_by_index[i] for i in sorted(completed_by_index)]
-    if existing and existing.get("complete") and existing.get("highlights") is not None:
+    if (
+        existing
+        and existing.get("complete")
+        and existing.get("highlights") is not None
+        and existing.get("version") == HIGHLIGHT_SELECTION_VERSION
+    ):
         return existing
     for batch in completed_batches:
         candidates.extend(batch.get("highlights", []))
@@ -895,9 +903,17 @@ def call_highlight_api_from_beats(
                 progress.update(int(result["index"]), f"batch {int(result['index'])}/{total_batches}: {len(batch_candidates)} candidates", force=True)
                 _write_partial_highlights(cache_path, completed_batches, complete=False)
 
-    candidates = keep_postable_highlights(dedupe_highlights(candidates), min_score=MIN_POSTABLE_SCORE - 3)
+    candidates = keep_postable_highlights(
+        dedupe_highlights(candidates),
+        min_score=70,
+        min_ending=60,
+        max_context_risk=88,
+        min_first_3s=55,
+        min_payoff=55,
+        min_shareability=50,
+    )
     if not candidates:
-        result = {"highlights": [], "complete": True, "batches": completed_batches}
+        result = {"version": HIGHLIGHT_SELECTION_VERSION, "highlights": [], "complete": True, "batches": completed_batches}
         if cache_path:
             write_json(cache_path, result)
         return result
@@ -938,7 +954,16 @@ def call_highlight_api_from_beats(
         if int(h.get("score", 0) or 0) >= MIN_POSTABLE_SCORE:
             selected.append(h)
     result = {
-        "highlights": keep_postable_highlights(selected),
+        "version": HIGHLIGHT_SELECTION_VERSION,
+        "highlights": keep_postable_highlights(
+            selected,
+            min_score=74,
+            min_ending=64,
+            max_context_risk=86,
+            min_first_3s=56,
+            min_payoff=56,
+            min_shareability=50,
+        ),
         "complete": True,
         "batches": sorted(completed_batches, key=lambda item: int(item.get("index", 0) or 0)),
     }
@@ -972,6 +997,11 @@ def keep_postable_highlights(
     highlights: List[Dict],
     min_score: int = MIN_POSTABLE_SCORE,
     max_duration: float = 75.5,
+    min_ending: int = 72,
+    max_context_risk: int = 82,
+    min_first_3s: int = 60,
+    min_payoff: int = 60,
+    min_shareability: int = 55,
 ) -> List[Dict]:
     kept = []
     for h in highlights:
@@ -999,7 +1029,13 @@ def keep_postable_highlights(
             first_3s = 100
             payoff = 100
             shareability = 100
-        if ending < 78 or context_risk > 72 or first_3s < 70 or payoff < 70 or shareability < 68:
+        if (
+            ending < min_ending
+            or context_risk > max_context_risk
+            or first_3s < min_first_3s
+            or payoff < min_payoff
+            or shareability < min_shareability
+        ):
             continue
         if duration < 10.0 or duration > max_duration:
             continue
@@ -1020,7 +1056,7 @@ def final_quality_review_with_llm(
     if not candidates or num_clips <= 0:
         return []
     cached = read_json(cache_path) if cache_path else None
-    if cached and cached.get("complete") and cached.get("clips") is not None and cached.get("version") == 1:
+    if cached and cached.get("complete") and cached.get("clips") is not None and cached.get("version") == FINAL_QUALITY_REVIEW_VERSION:
         return cached.get("clips", [])[:num_clips]
 
     review_items = []
@@ -1102,11 +1138,19 @@ def final_quality_review_with_llm(
             h["virality_reason"] = h["reason"]
         selected.append(h)
 
-    selected = keep_postable_highlights(dedupe_highlights(selected), min_score=82)
+    selected = keep_postable_highlights(
+        dedupe_highlights(selected),
+        min_score=76,
+        min_ending=68,
+        max_context_risk=85,
+        min_first_3s=58,
+        min_payoff=58,
+        min_shareability=52,
+    )
     selected = sorted(selected, key=lambda h: int(h.get("viral_score", h.get("score", 0)) or 0), reverse=True)[:num_clips]
     user_log("Final quality review", f"{len(selected)} clips passed the upload-quality gate")
     if cache_path:
-        write_json(cache_path, {"complete": True, "version": 1, "clips": selected})
+        write_json(cache_path, {"complete": True, "version": FINAL_QUALITY_REVIEW_VERSION, "clips": selected})
     return selected
 
 
