@@ -1,0 +1,9 @@
+python-dotenv>=1.0
+requests>=2.31
+yt-dlp>=2024.1.1
+faster-whisper>=1.0.0
+openai>=1.0.0
+opencv-python>=4.8.0
+pywebview>=5.0
+# torch is only needed if you want CUDA Whisper. CPU works without it.
+# torch>=2.0
