@@ -11,7 +11,10 @@ drive any OpenAI-compatible API.
 """
 import json
 import re
+import math
 from typing import Callable, Dict, List, Optional
+
+from .local.progress import Progress, user_log
 
 
 LLMFn = Callable[[str], str]
@@ -461,11 +464,15 @@ def build_beat_map(transcript: Dict, llm_fn: LLMFn, analysis_map: Optional[Dict]
     all_beats: List[Dict] = []
     start = 0.0
     chunk_index = 1
+    step = BEAT_MAP_CHUNK_SECONDS - BEAT_MAP_OVERLAP_SECONDS
+    total_chunks = max(1, int(math.ceil(max(duration, 1.0) / step)))
+    progress = Progress("LLM story beats", total_chunks)
     while start < max(duration, 1.0):
         end = min(duration, start + BEAT_MAP_CHUNK_SECONDS)
         text = _transcript_text_for_window(transcript, start, end)
         if not text.strip():
-            start += BEAT_MAP_CHUNK_SECONDS - BEAT_MAP_OVERLAP_SECONDS
+            progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: no speech", force=True)
+            start += step
             chunk_index += 1
             continue
         analysis_json = json.dumps(
@@ -480,17 +487,18 @@ def build_beat_map(transcript: Dict, llm_fn: LLMFn, analysis_map: Optional[Dict]
             f"Timestamped transcript window:\n{text[:18000]}"
         )
         try:
+            user_log("LLM story beats", f"chunk {chunk_index}/{total_chunks}, {start:.0f}s-{end:.0f}s")
             raw = llm_fn(prompt)
             beats = _parse_beats(_parse_json_loose(raw))
             all_beats.extend(beats)
-            print(f"[highlights] beat map chunk {chunk_index}: {len(beats)} beats", flush=True)
+            progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: {len(beats)} beats", force=True)
         except Exception as e:
             raise RuntimeError(
                 f"Story beat analysis failed on chunk {chunk_index} ({start:.0f}s-{end:.0f}s): {e}"
             ) from e
         if end >= duration:
             break
-        start += BEAT_MAP_CHUNK_SECONDS - BEAT_MAP_OVERLAP_SECONDS
+        start += step
         chunk_index += 1
 
     all_beats = _dedupe_beats(all_beats)
@@ -557,6 +565,8 @@ def call_highlight_api_from_beats(
 
     candidates: List[Dict] = []
     sorted_beats = sorted(beats, key=lambda b: int(b.get("clip_potential", 0) or 0), reverse=True)
+    total_batches = max(1, int(math.ceil(len(sorted_beats) / BEAT_SELECT_BATCH_SIZE)))
+    progress = Progress("LLM candidates", total_batches)
     for batch_index, offset in enumerate(range(0, len(sorted_beats), BEAT_SELECT_BATCH_SIZE), 1):
         batch = sorted_beats[offset: offset + BEAT_SELECT_BATCH_SIZE]
         if not batch:
@@ -570,10 +580,11 @@ def call_highlight_api_from_beats(
             beat_map_json=batch_json,
         )
         try:
+            user_log("LLM candidates", f"batch {batch_index}/{total_batches}, reviewing {len(batch)} beats")
             result = _parse_json_loose(llm_fn(prompt))
             batch_candidates = result.get("highlights", [])
             candidates.extend(batch_candidates)
-            print(f"[highlights] candidate batch {batch_index}: {len(batch_candidates)} candidates", flush=True)
+            progress.update(batch_index, f"batch {batch_index}/{total_batches}: {len(batch_candidates)} candidates", force=True)
         except Exception as e:
             raise RuntimeError(f"Candidate selection failed on beat batch {batch_index}: {e}") from e
 
@@ -597,6 +608,7 @@ def call_highlight_api_from_beats(
         num_clips=num_clips,
         candidates_json=json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:18000],
     )
+    user_log("LLM final review", f"choosing up to {num_clips} clips from {len(top_candidates)} candidates")
     data = _parse_json_loose(llm_fn(prompt))
     selected = []
     by_id = {i + 1: h for i, h in enumerate(top_candidates)}
@@ -725,7 +737,7 @@ Candidates:
                 h["end_time"] = float(item["end_time"])
         if int(h.get("score", 0) or 0) >= MIN_POSTABLE_SCORE:
             selected.append(h)
-    print(f"[highlights] verifier selected {len(selected)} clips (timestamps may be adjusted)", flush=True)
+    user_log("Final boundary check", f"{len(selected)} clips selected")
     return selected[:num_clips]
 
 
@@ -744,10 +756,13 @@ def get_highlights(
         raise ValueError("llm_fn is required (pass call_openai_llm)")
     duration = transcript.get("duration", 0)
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
-    print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
+    user_log(
+        "Content profile",
+        f"{content_info.get('content_type')} / {content_info.get('density')} / {duration:.0f}s",
+    )
 
     if beat_map and beat_map.get("beats"):
-        print(f"[highlights] selecting from beat map: {len(beat_map.get('beats', []))} beats", flush=True)
+        user_log("Beat map selection", f"{len(beat_map.get('beats', []))} beats to review")
         result = call_highlight_api_from_beats(
             beat_map,
             content_info,

@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import webview
+from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -92,10 +93,16 @@ class _LogCapture(io.TextIOBase):
         self._emit = emit_fn
         self._original = original
 
+    def _timestamped(self, line: str) -> str:
+        stripped = line.rstrip()
+        if re.match(r"^\[\d{2}:\d{2}:\d{2}\]\s", stripped):
+            return stripped
+        return f"[{datetime.now().strftime('%H:%M:%S')}] {stripped}"
+
     def write(self, s):
         if s and s.strip():
             for line in s.splitlines():
-                self._emit("log", {"text": line.rstrip()})
+                self._emit("log", {"text": self._timestamped(line)})
         return self._original.write(s)
 
     def flush(self):
