@@ -311,27 +311,37 @@ def generate_shorts(
 
     stage("Finding story beats", "grouping the episode into complete jokes/scenes/ideas")
     beat_map = read_json(beat_map_json)
-    if beat_map and beat_map.get("beats"):
+    if beat_map and beat_map.get("complete") and beat_map.get("beats"):
         user_log("Story beats ready", f"{len(beat_map.get('beats', []))} beats loaded from cache")
     else:
-        beat_map = build_beat_map(transcript, call_openai_llm, analysis_map=analysis_map)
+        if beat_map and beat_map.get("chunks"):
+            user_log("Story beats resume", f"{int(beat_map.get('completed_chunks', 0) or 0)} chunks already saved")
+        beat_map = build_beat_map(
+            transcript,
+            call_openai_llm,
+            analysis_map=analysis_map,
+            cache_path=beat_map_json,
+        )
         beat_map = _snap_beat_boundaries_to_utterances(beat_map, analysis_map)
         write_json(beat_map_json, beat_map)
         user_log("Story beats ready", f"{len(beat_map.get('beats', []))} complete beats found")
 
     stage("Choosing candidate shorts", "ranking beats by hook, payoff, audio energy, and scene flow")
     highlights_result = read_json(highlights_json)
-    if highlights_result and len(highlights_result.get("highlights", [])) >= num_clips:
+    if highlights_result and highlights_result.get("complete"):
         user_log("Candidates ready", f"{len(highlights_result.get('highlights', []))} candidates loaded from cache")
     else:
-        if highlights_result:
-            user_log("Candidates cache incomplete", f"rebuilding {num_clips} shorts")
+        if highlights_result and highlights_result.get("batches"):
+            user_log("Candidates resume", f"{int(highlights_result.get('completed_batches', 0) or 0)} batches already saved")
+        elif highlights_result:
+            user_log("Candidates cache incomplete", f"rebuilding up to {num_clips} shorts")
         highlights_result = get_highlights(
             transcript,
             num_clips=num_clips,
             llm_fn=call_openai_llm,
             beat_map=beat_map,
             analysis_map=analysis_map,
+            cache_path=highlights_json,
         )
         highlights_result["highlights"] = keep_postable_highlights(
             score_highlights(highlights_result.get("highlights", []), analysis_map)

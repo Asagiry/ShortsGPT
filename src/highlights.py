@@ -15,6 +15,7 @@ import math
 from typing import Callable, Dict, List, Optional
 
 from .local.progress import Progress, user_log
+from .local.session import read_json, write_json
 
 
 LLMFn = Callable[[str], str]
@@ -459,21 +460,105 @@ def _compact_analysis_for_prompt(analysis_map: Optional[Dict]) -> Dict:
     }
 
 
-def build_beat_map(transcript: Dict, llm_fn: LLMFn, analysis_map: Optional[Dict] = None) -> Dict:
+def _beat_map_chunks(transcript: Dict) -> List[Dict]:
     duration = float(transcript.get("duration", 0.0) or 0.0)
-    all_beats: List[Dict] = []
-    start = 0.0
-    chunk_index = 1
     step = BEAT_MAP_CHUNK_SECONDS - BEAT_MAP_OVERLAP_SECONDS
-    total_chunks = max(1, int(math.ceil(max(duration, 1.0) / step)))
-    progress = Progress("LLM story beats", total_chunks)
+    chunks = []
+    start = 0.0
+    index = 1
     while start < max(duration, 1.0):
         end = min(duration, start + BEAT_MAP_CHUNK_SECONDS)
+        chunks.append({"index": index, "start": start, "end": end})
+        if end >= duration:
+            break
+        start += step
+        index += 1
+    return chunks or [{"index": 1, "start": 0.0, "end": duration}]
+
+
+def _partial_chunks(existing: Optional[Dict]) -> Dict[int, Dict]:
+    chunks = existing.get("chunks", []) if existing else []
+    return {int(item.get("index", 0)): item for item in chunks if int(item.get("index", 0) or 0) > 0}
+
+
+def _partial_batches(existing: Optional[Dict]) -> Dict[int, Dict]:
+    batches = existing.get("batches", []) if existing else []
+    return {int(item.get("index", 0)): item for item in batches if int(item.get("index", 0) or 0) > 0}
+
+
+def _write_partial_beat_map(cache_path: Optional[str], chunks: List[Dict], complete: bool = False) -> None:
+    if not cache_path:
+        return
+    all_beats: List[Dict] = []
+    for chunk in sorted(chunks, key=lambda item: int(item.get("index", 0) or 0)):
+        all_beats.extend(chunk.get("beats", []))
+    payload = {
+        "source": "llm_chunked",
+        "complete": complete,
+        "completed_chunks": len(chunks),
+        "chunks": chunks,
+        "beats": _dedupe_beats(all_beats),
+    }
+    write_json(cache_path, payload)
+
+
+def _write_partial_highlights(cache_path: Optional[str], batches: List[Dict], complete: bool = False) -> None:
+    if not cache_path:
+        return
+    highlights: List[Dict] = []
+    for batch in sorted(batches, key=lambda item: int(item.get("index", 0) or 0)):
+        highlights.extend(batch.get("highlights", []))
+    payload = {
+        "complete": complete,
+        "completed_batches": len(batches),
+        "batches": batches,
+        "highlights": dedupe_highlights(highlights),
+    }
+    write_json(cache_path, payload)
+
+
+def build_beat_map(
+    transcript: Dict,
+    llm_fn: LLMFn,
+    analysis_map: Optional[Dict] = None,
+    cache_path: Optional[str] = None,
+) -> Dict:
+    duration = float(transcript.get("duration", 0.0) or 0.0)
+    chunk_plan = _beat_map_chunks(transcript)
+    total_chunks = len(chunk_plan)
+    existing = read_json(cache_path) if cache_path else None
+    completed_by_index = _partial_chunks(existing)
+    completed_chunks = [completed_by_index[i] for i in sorted(completed_by_index)]
+
+    if existing and existing.get("complete") and existing.get("beats"):
+        user_log("Story beats ready", f"{len(existing.get('beats', []))} beats loaded from cache")
+        return existing
+
+    progress = Progress("LLM story beats", total_chunks)
+    for done_index in sorted(completed_by_index):
+        progress.update(
+            done_index,
+            f"chunk {done_index}/{total_chunks}: cached",
+            force=True,
+        )
+
+    for chunk in chunk_plan:
+        chunk_index = int(chunk["index"])
+        start = float(chunk["start"])
+        end = float(chunk["end"])
+        if chunk_index in completed_by_index:
+            continue
         text = _transcript_text_for_window(transcript, start, end)
         if not text.strip():
             progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: no speech", force=True)
-            start += step
-            chunk_index += 1
+            completed_chunks.append({
+                "index": chunk_index,
+                "start": start,
+                "end": end,
+                "beats": [],
+                "skipped": "no speech",
+            })
+            _write_partial_beat_map(cache_path, completed_chunks, complete=False)
             continue
         analysis_json = json.dumps(
             _analysis_for_window(analysis_map, start, end),
@@ -490,21 +575,35 @@ def build_beat_map(transcript: Dict, llm_fn: LLMFn, analysis_map: Optional[Dict]
             user_log("LLM story beats", f"chunk {chunk_index}/{total_chunks}, {start:.0f}s-{end:.0f}s")
             raw = llm_fn(prompt)
             beats = _parse_beats(_parse_json_loose(raw))
-            all_beats.extend(beats)
             progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: {len(beats)} beats", force=True)
+            completed_chunks.append({
+                "index": chunk_index,
+                "start": start,
+                "end": end,
+                "beats": beats,
+            })
+            _write_partial_beat_map(cache_path, completed_chunks, complete=False)
         except Exception as e:
             raise RuntimeError(
                 f"Story beat analysis failed on chunk {chunk_index} ({start:.0f}s-{end:.0f}s): {e}"
             ) from e
-        if end >= duration:
-            break
-        start += step
-        chunk_index += 1
 
+    all_beats: List[Dict] = []
+    for chunk in completed_chunks:
+        all_beats.extend(chunk.get("beats", []))
     all_beats = _dedupe_beats(all_beats)
     if not all_beats:
         raise RuntimeError("Story beat analysis returned zero beats.")
-    return {"beats": all_beats, "source": "llm_chunked"}
+    complete_payload = {
+        "beats": all_beats,
+        "source": "llm_chunked",
+        "complete": True,
+        "completed_chunks": len(completed_chunks),
+        "chunks": sorted(completed_chunks, key=lambda item: int(item.get("index", 0) or 0)),
+    }
+    if cache_path:
+        write_json(cache_path, complete_payload)
+    return complete_payload
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
@@ -558,6 +657,7 @@ def call_highlight_api_from_beats(
     num_clips: int,
     llm_fn: LLMFn = None,
     analysis_map: Optional[Dict] = None,
+    cache_path: Optional[str] = None,
 ) -> Dict:
     beats = beat_map.get("beats", [])
     if not beats:
@@ -566,10 +666,21 @@ def call_highlight_api_from_beats(
     candidates: List[Dict] = []
     sorted_beats = sorted(beats, key=lambda b: int(b.get("clip_potential", 0) or 0), reverse=True)
     total_batches = max(1, int(math.ceil(len(sorted_beats) / BEAT_SELECT_BATCH_SIZE)))
+    existing = read_json(cache_path) if cache_path else None
+    completed_by_index = _partial_batches(existing)
+    completed_batches = [completed_by_index[i] for i in sorted(completed_by_index)]
+    if existing and existing.get("complete") and existing.get("highlights") is not None:
+        return existing
+    for batch in completed_batches:
+        candidates.extend(batch.get("highlights", []))
     progress = Progress("LLM candidates", total_batches)
+    for done_index in sorted(completed_by_index):
+        progress.update(done_index, f"batch {done_index}/{total_batches}: cached", force=True)
     for batch_index, offset in enumerate(range(0, len(sorted_beats), BEAT_SELECT_BATCH_SIZE), 1):
         batch = sorted_beats[offset: offset + BEAT_SELECT_BATCH_SIZE]
         if not batch:
+            continue
+        if batch_index in completed_by_index:
             continue
         batch_json = json.dumps({"beats": batch}, ensure_ascii=False, separators=(",", ":"))[:14000]
         prompt = BEAT_HIGHLIGHT_PROMPT.format(
@@ -585,12 +696,20 @@ def call_highlight_api_from_beats(
             batch_candidates = result.get("highlights", [])
             candidates.extend(batch_candidates)
             progress.update(batch_index, f"batch {batch_index}/{total_batches}: {len(batch_candidates)} candidates", force=True)
+            completed_batches.append({
+                "index": batch_index,
+                "highlights": batch_candidates,
+            })
+            _write_partial_highlights(cache_path, completed_batches, complete=False)
         except Exception as e:
             raise RuntimeError(f"Candidate selection failed on beat batch {batch_index}: {e}") from e
 
     candidates = keep_postable_highlights(dedupe_highlights(candidates), min_score=MIN_POSTABLE_SCORE - 3)
     if not candidates:
-        return {"highlights": []}
+        result = {"highlights": [], "complete": True, "batches": completed_batches}
+        if cache_path:
+            write_json(cache_path, result)
+        return result
 
     top_candidates = sorted(candidates, key=lambda h: int(h.get("score", 0) or 0), reverse=True)[: max(num_clips * 5, 20)]
     review_items = []
@@ -627,7 +746,14 @@ def call_highlight_api_from_beats(
             h["virality_reason"] = str(item["reason"])
         if int(h.get("score", 0) or 0) >= MIN_POSTABLE_SCORE:
             selected.append(h)
-    return {"highlights": keep_postable_highlights(selected)}
+    result = {
+        "highlights": keep_postable_highlights(selected),
+        "complete": True,
+        "batches": sorted(completed_batches, key=lambda item: int(item.get("index", 0) or 0)),
+    }
+    if cache_path:
+        write_json(cache_path, result)
+    return result
 
 
 def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
@@ -747,6 +873,7 @@ def get_highlights(
     llm_fn: Optional[LLMFn] = None,
     beat_map: Optional[Dict] = None,
     analysis_map: Optional[Dict] = None,
+    cache_path: Optional[str] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -769,6 +896,7 @@ def get_highlights(
             num_clips=num_clips,
             llm_fn=llm_fn,
             analysis_map=analysis_map,
+            cache_path=cache_path,
         )
         highlights = dedupe_highlights(result.get("highlights", []))
         if not highlights:
