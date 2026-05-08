@@ -11,6 +11,7 @@ dist/
 dist_*/
 build/
 build_*/
+_internal/
 *.spec
 *.exe
 *.mp4
