@@ -12,10 +12,14 @@ from typing import Dict, List, Optional, Tuple
 from ..config import local_output_dir
 from .progress import Progress, user_log
 
-PAUSE_TIGHTEN_VERSION = 5
+PAUSE_TIGHTEN_VERSION = 6
 MIN_VALID_VIDEO_BYTES = 64 * 1024
 MIN_TIGHTEN_RANGE_SECONDS = 2.25
 MAX_VISUAL_EDGE_KEEP_SECONDS = 4.0
+SUBTITLE_X = 540
+SUBTITLE_Y = 1120
+SUBTITLE_POP_OFFSET = 26
+SUBTITLE_POP_MS = 140
 
 
 def _subprocess_no_window_kwargs() -> Dict:
@@ -680,6 +684,25 @@ def _split_subtitle_segment(text: str, start: float, end: float) -> List[Dict]:
     return out
 
 
+def _plain_ass_text(text: str) -> str:
+    return re.sub(r"\{[^}]*\}", "", text or "").replace(r"\N", " ")
+
+
+def _ass_subtitle_text(text: str) -> str:
+    if "{" not in text:
+        return r"\N".join(textwrap.wrap(text, width=24)[:2])
+    return text
+
+
+def _subtitle_animation_tags() -> str:
+    start_y = SUBTITLE_Y + SUBTITLE_POP_OFFSET
+    return (
+        rf"\an5\move({SUBTITLE_X},{start_y},{SUBTITLE_X},{SUBTITLE_Y},0,{SUBTITLE_POP_MS})"
+        rf"\fscx94\fscy94\t(0,{SUBTITLE_POP_MS},\fscx100\fscy100)"
+        r"\fad(35,80)"
+    )
+
+
 def _write_ass(path: str, segments: List[Dict]) -> None:
     header = """[Script Info]
 ScriptType: v4.00+
@@ -689,19 +712,31 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,76,&H00FFFFFF,&H0000FFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,6,1,2,60,60,130,1
+Style: Default,Arial,76,&H00FFFFFF,&H0000FFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,6,0,5,60,60,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = [header]
     for segment in segments:
-        text = segment["text"]
-        if "{" not in text:
-            text = r"\N".join(textwrap.wrap(text, width=24)[:2])
+        text = _ass_subtitle_text(segment["text"])
+        start = _ass_time(segment["start"])
+        end = _ass_time(segment["end"])
+        glow_color = _random_ass_color(_plain_ass_text(segment["text"]))
+        animation = _subtitle_animation_tags()
+        glow = (
+            rf"{{{animation}\bord14\blur9\shad0\1a&HFF&\3a&H30&\3c&H{glow_color}&}}"
+            f"{text}"
+        )
+        face = (
+            rf"{{{animation}\bord5\blur0.7\shad0\3c&H000000&}}"
+            f"{text}"
+        )
         lines.append(
-            f"Dialogue: 0,{_ass_time(segment['start'])},{_ass_time(segment['end'])},"
-            f"Default,,0,0,0,,{text}\n"
+            f"Dialogue: 0,{start},{end},Default,,0,0,0,,{glow}\n"
+        )
+        lines.append(
+            f"Dialogue: 1,{start},{end},Default,,0,0,0,,{face}\n"
         )
     with open(path, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
