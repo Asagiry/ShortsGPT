@@ -257,6 +257,50 @@ Candidates:
 {candidates_json}"""
 
 
+FINAL_QUALITY_PROMPT = """You are the release editor for a short-form channel.
+
+Your job is to decide what is actually worth rendering and uploading.
+Do not protect previous choices. Reject anything that is average, unclear, duplicated, or incomplete.
+
+Editorial brief:
+{episode_context}
+
+Content type: {content_type} | Density: {density}
+
+Platform goals:
+- Strong first 1-3 seconds.
+- A complete mini-story, joke, conflict, reveal, lesson, or emotional turn.
+- Clear payoff/reaction/conclusion.
+- Viewer understands the moment without seeing the full episode.
+- No duplicate ideas in the final set.
+
+Content-specific rules:
+- cartoon_dialogue/sitcom: setup -> reversal -> punchline/reaction. Keep reaction timing.
+- movie_scene: conflict/tension -> turn -> emotional or narrative landing. Do not over-tighten pauses.
+- talking_head/podcast/interview: claim/story -> proof/detail -> takeaway. Tighten filler.
+- gameplay/screen: visible event -> reaction/result. Do not cut away from the visual event.
+
+For each kept clip:
+- You may adjust start_time/end_time only to improve hook, context, and complete ending.
+- Create a short intro_overlay only if the first seconds need context. Max 55 characters. Empty string if not needed.
+- Provide highlight_keywords for captions: 2-6 words/phrases that should pop visually.
+- Provide pause_policy: keep_reactions, balanced, or tight.
+- Provide upload metadata: 3 titles, description, hashtags, pinned_comment.
+- Provide score_matrix and viral_score 0-100.
+- Provide semantic_key, a short meaning label used to remove duplicate ideas.
+
+Hard quality gate:
+- Keep only clips with viral_score >= 82.
+- Reject clips with weak first 3 seconds, missing setup, missing payoff, unclear context, duplicated meaning, or ending before the thought lands.
+- If only 2 clips are great, keep 2. If none are great, keep none.
+
+Respond JSON only:
+{{"clips":[{{"id":int,"keep":true,"start_time":float,"end_time":float,"viral_score":int,"score_matrix":{{"hook":0,"first_3s":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"shareability":0,"rewatch_potential":0,"context_loss_risk":0}},"semantic_key":"...","intro_overlay":"...","hook_sentence":"...","pause_policy":"balanced","highlight_keywords":["..."],"titles":["...","...","..."],"description":"...","hashtags":["#..."],"pinned_comment":"...","reason":"..."}}]}}
+
+Candidates:
+{candidates_json}"""
+
+
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
@@ -938,21 +982,132 @@ def keep_postable_highlights(
         except (TypeError, ValueError):
             continue
         duration = end - start
-        if score < min_score:
+        viral_score = int(h.get("viral_score", score) or score)
+        effective_score = max(score, viral_score)
+        if effective_score < min_score:
             continue
         matrix = h.get("score_matrix") if isinstance(h.get("score_matrix"), dict) else {}
         try:
             ending = int(matrix.get("ending_completeness", 100))
             context_risk = int(matrix.get("context_loss_risk", 0))
+            first_3s = int(matrix.get("first_3s", matrix.get("hook", 100)))
+            payoff = int(matrix.get("payoff_strength", 100))
+            shareability = int(matrix.get("shareability", 100))
         except (TypeError, ValueError):
             ending = 100
             context_risk = 0
-        if ending < 78 or context_risk > 72:
+            first_3s = 100
+            payoff = 100
+            shareability = 100
+        if ending < 78 or context_risk > 72 or first_3s < 70 or payoff < 70 or shareability < 68:
             continue
         if duration < 10.0 or duration > max_duration:
             continue
         kept.append(h)
     return kept
+
+
+def final_quality_review_with_llm(
+    transcript: Dict,
+    candidates: List[Dict],
+    num_clips: int,
+    llm_fn: LLMFn,
+    episode_digest: Optional[Dict] = None,
+    analysis_map: Optional[Dict] = None,
+    content_info: Optional[Dict] = None,
+    cache_path: Optional[str] = None,
+) -> List[Dict]:
+    if not candidates or num_clips <= 0:
+        return []
+    cached = read_json(cache_path) if cache_path else None
+    if cached and cached.get("complete") and cached.get("clips") is not None and cached.get("version") == 1:
+        return cached.get("clips", [])[:num_clips]
+
+    review_items = []
+    source_candidates = sorted(
+        candidates,
+        key=lambda h: int(h.get("viral_score", h.get("score", 0)) or 0),
+        reverse=True,
+    )[: max(num_clips * 4, 16)]
+    for index, h in enumerate(source_candidates, 1):
+        start = float(h.get("start_time", 0.0))
+        end = float(h.get("end_time", 0.0))
+        context = _transcript_text_for_window(transcript, max(0.0, start - 8.0), end + 10.0)
+        media = _analysis_for_window(analysis_map, start, end)
+        review_items.append({
+            "id": index,
+            "title": h.get("title", ""),
+            "start_time": round(start, 2),
+            "end_time": round(end, 2),
+            "duration": round(end - start, 2),
+            "score": int(h.get("score", 0) or 0),
+            "viral_score": int(h.get("viral_score", h.get("score", 0)) or 0),
+            "hook_sentence": h.get("hook_sentence", ""),
+            "virality_reason": h.get("virality_reason", ""),
+            "score_matrix": h.get("score_matrix", {}),
+            "transcript_context": context[:2400],
+            "media": media,
+        })
+
+    content_info = content_info or {"content_type": "other", "density": "medium"}
+    prompt = FINAL_QUALITY_PROMPT.format(
+        episode_context=_episode_context_text(episode_digest),
+        content_type=content_info.get("content_type", "other"),
+        density=content_info.get("density", "medium"),
+        candidates_json=json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:26000],
+    )
+    user_log("Final quality review", f"scoring {len(review_items)} clips for hook, payoff, duplicates, and upload metadata")
+    data = _parse_json_loose(llm_fn(prompt))
+    by_id = {i + 1: h for i, h in enumerate(source_candidates)}
+    selected: List[Dict] = []
+    seen_keys = set()
+    for item in data.get("clips", []):
+        try:
+            cid = int(item.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cid not in by_id or item.get("keep") is False:
+            continue
+        h = dict(by_id[cid])
+        try:
+            h["start_time"] = float(item.get("start_time", h.get("start_time", 0.0)))
+            h["end_time"] = float(item.get("end_time", h.get("end_time", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if h["end_time"] <= h["start_time"]:
+            continue
+        semantic_key = _compact_text(str(item.get("semantic_key", h.get("title", ""))).casefold(), 90)
+        if semantic_key and semantic_key in seen_keys:
+            continue
+        if semantic_key:
+            seen_keys.add(semantic_key)
+            h["semantic_key"] = semantic_key
+        try:
+            h["viral_score"] = int(item.get("viral_score", h.get("score", 0)) or 0)
+        except (TypeError, ValueError):
+            h["viral_score"] = int(h.get("score", 0) or 0)
+        h["score"] = max(int(h.get("score", 0) or 0), int(h.get("viral_score", 0) or 0))
+        if isinstance(item.get("score_matrix"), dict):
+            h["score_matrix"] = item["score_matrix"]
+        for key in ("intro_overlay", "hook_sentence", "pause_policy", "description", "pinned_comment", "reason"):
+            if item.get(key) is not None:
+                h[key] = str(item.get(key) or "")
+        for key in ("highlight_keywords", "titles", "hashtags"):
+            value = item.get(key)
+            if isinstance(value, list):
+                h[key] = [str(v) for v in value if str(v).strip()]
+        if h.get("titles"):
+            h["title"] = h["titles"][0]
+        if h.get("reason"):
+            h["virality_reason"] = h["reason"]
+        selected.append(h)
+
+    selected = keep_postable_highlights(dedupe_highlights(selected), min_score=82)
+    selected = sorted(selected, key=lambda h: int(h.get("viral_score", h.get("score", 0)) or 0), reverse=True)[:num_clips]
+    user_log("Final quality review", f"{len(selected)} clips passed the upload-quality gate")
+    if cache_path:
+        write_json(cache_path, {"complete": True, "version": 1, "clips": selected})
+    return selected
 
 
 def refine_highlight_boundaries_with_llm(

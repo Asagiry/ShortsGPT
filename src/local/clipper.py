@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from ..config import local_output_dir
 from .progress import Progress, user_log
 
-PAUSE_TIGHTEN_VERSION = 6
+PAUSE_TIGHTEN_VERSION = 7
 MIN_VALID_VIDEO_BYTES = 64 * 1024
 MIN_TIGHTEN_RANGE_SECONDS = 2.25
 MAX_VISUAL_EDGE_KEEP_SECONDS = 4.0
@@ -181,8 +181,13 @@ def _speech_ranges_from_transcript(
     transcript: Optional[Dict],
     start_time: float,
     end_time: float,
+    tighten_enabled: Optional[bool] = None,
+    threshold_override: Optional[float] = None,
+    keep_override: Optional[float] = None,
 ) -> Tuple[List[Tuple[float, float]], List[Dict]]:
-    if not transcript or not _pause_tighten_enabled():
+    if tighten_enabled is None:
+        tighten_enabled = _pause_tighten_enabled()
+    if not transcript or not tighten_enabled:
         return [(start_time, end_time)], [{
             "source_start": start_time,
             "source_end": end_time,
@@ -190,8 +195,8 @@ def _speech_ranges_from_transcript(
             "target_end": end_time - start_time,
         }]
 
-    threshold = _pause_threshold()
-    keep = _pause_keep()
+    threshold = threshold_override if threshold_override is not None else _pause_threshold()
+    keep = keep_override if keep_override is not None else _pause_keep()
     speech = []
     for segment in transcript.get("segments", []):
         seg_start = float(segment["start"])
@@ -694,6 +699,24 @@ def _ass_subtitle_text(text: str) -> str:
     return text
 
 
+def _ass_keyword_text(text: str, keywords: Optional[List[str]] = None) -> str:
+    if not text or not keywords:
+        return _ass_subtitle_text(text)
+    escaped = _ass_subtitle_text(_ass_escape(text))
+    plain_keywords = sorted(
+        {_ass_escape(str(k).strip()) for k in keywords if str(k).strip()},
+        key=len,
+        reverse=True,
+    )[:8]
+    for keyword in plain_keywords:
+        if len(keyword) < 3:
+            continue
+        color = _random_ass_color(keyword)
+        pattern = re.compile(re.escape(keyword), flags=re.IGNORECASE)
+        escaped = pattern.sub(lambda m: rf"{{\c&H{color}&\bord6}}{m.group(0)}{{\r}}", escaped)
+    return escaped
+
+
 def _subtitle_animation_tags() -> str:
     start_y = SUBTITLE_Y + SUBTITLE_POP_OFFSET
     return (
@@ -713,13 +736,25 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial,76,&H00FFFFFF,&H0000FFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,6,0,5,60,60,0,1
+Style: Intro,Arial,68,&H00FFFFFF,&H0000FFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,5,0,5,70,70,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = [header]
     for segment in segments:
-        text = _ass_subtitle_text(segment["text"])
+        if segment.get("kind") == "intro":
+            intro_text = _ass_subtitle_text(_ass_escape(segment["text"]))
+            start = _ass_time(segment["start"])
+            end = _ass_time(segment["end"])
+            tags = (
+                rf"\an5\pos({SUBTITLE_X},{SUBTITLE_Y - 250})"
+                rf"\fscx92\fscy92\t(0,180,\fscx100\fscy100)"
+                r"\fad(90,140)"
+            )
+            lines.append(f"Dialogue: 2,{start},{end},Intro,,0,0,0,,{{{tags}}}{intro_text}\n")
+            continue
+        text = _ass_keyword_text(segment["text"], segment.get("highlight_keywords"))
         start = _ass_time(segment["start"])
         end = _ass_time(segment["end"])
         glow_color = _random_ass_color(_plain_ass_text(segment["text"]))
@@ -742,7 +777,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         fh.writelines(lines)
 
 
-def _burn_subtitles(video_path: str, segments: List[Dict]) -> str:
+def _burn_subtitles(video_path: str, segments: List[Dict], highlight: Optional[Dict] = None) -> str:
+    highlight = highlight or {}
+    intro = str(highlight.get("intro_overlay", "") or "").strip()
+    if intro:
+        intro = intro[:70]
+        segments = [{
+            "kind": "intro",
+            "start": 0.0,
+            "end": min(3.0, max(1.4, segments[0]["start"] + 1.8 if segments else 2.4)),
+            "text": intro,
+        }] + segments
+    keywords = highlight.get("highlight_keywords") if isinstance(highlight.get("highlight_keywords"), list) else []
+    if keywords:
+        segments = [
+            {**segment, "highlight_keywords": keywords}
+            if segment.get("kind") != "intro" else segment
+            for segment in segments
+        ]
     if not segments:
         user_log("Subtitles", "no subtitle lines for this clip")
         return video_path
@@ -792,9 +844,7 @@ def _is_complete_render(out_path: str, highlight: Dict) -> bool:
     except (OSError, ValueError):
         print(f"[resume] existing clip metadata is unreadable, will re-render: {out_path}", flush=True)
         return False
-    current_tighten = _pause_tighten_enabled()
-    current_threshold = _pause_threshold()
-    current_keep = _pause_keep()
+    current_tighten, current_threshold, current_keep = _clip_pause_settings(highlight)
     if data.get("subtitles") is not True or data.get("version") != PAUSE_TIGHTEN_VERSION:
         return False
     if bool(data.get("tighten_pauses")) != current_tighten:
@@ -802,6 +852,12 @@ def _is_complete_render(out_path: str, highlight: Dict) -> bool:
     if abs(float(data.get("pause_threshold", -1.0)) - current_threshold) > 0.01:
         return False
     if abs(float(data.get("pause_keep", -1.0)) - current_keep) > 0.01:
+        return False
+    if str(data.get("pause_policy", "")) != str(highlight.get("pause_policy", "")):
+        return False
+    if str(data.get("intro_overlay", "")) != str(highlight.get("intro_overlay", "")):
+        return False
+    if data.get("highlight_keywords", []) != highlight.get("highlight_keywords", []):
         return False
     return (
         abs(float(data.get("start_time", -1.0)) - float(highlight.get("start_time", 0.0))) < 0.05
@@ -815,8 +871,11 @@ def _write_render_sidecar(
     start_time: float,
     end_time: float,
     timing_map: List[Dict],
+    highlight: Optional[Dict] = None,
 ) -> None:
     import json
+    highlight = highlight or {}
+    tighten_enabled, threshold, keep = _clip_pause_settings(highlight)
     with open(_sidecar_path(out_path), "w", encoding="utf-8") as fh:
         json.dump({
             "version": PAUSE_TIGHTEN_VERSION,
@@ -825,11 +884,26 @@ def _write_render_sidecar(
             "start_time": start_time,
             "end_time": end_time,
             "tightened": len(timing_map) > 1,
-            "tighten_pauses": _pause_tighten_enabled(),
-            "pause_threshold": _pause_threshold(),
-            "pause_keep": _pause_keep(),
+            "tighten_pauses": tighten_enabled,
+            "pause_threshold": threshold,
+            "pause_keep": keep,
+            "pause_policy": highlight.get("pause_policy", ""),
+            "intro_overlay": highlight.get("intro_overlay", ""),
+            "highlight_keywords": highlight.get("highlight_keywords", []),
             "render_duration": timing_map[-1]["target_end"] if timing_map else end_time - start_time,
         }, fh, indent=2)
+
+
+def _clip_pause_settings(highlight: Optional[Dict]) -> Tuple[bool, float, float]:
+    base_enabled = _pause_tighten_enabled()
+    threshold = _pause_threshold()
+    keep = _pause_keep()
+    policy = str((highlight or {}).get("pause_policy", "")).strip().lower()
+    if policy == "keep_reactions":
+        return base_enabled, max(threshold, 1.9), max(keep, 0.78)
+    if policy == "tight":
+        return base_enabled, min(threshold, 0.85), min(keep, 0.28)
+    return base_enabled, threshold, keep
 
 
 def crop_clip_local(
@@ -839,10 +913,19 @@ def crop_clip_local(
     aspect_ratio: str,
     out_path: str,
     transcript: Optional[Dict] = None,
+    highlight: Optional[Dict] = None,
 ) -> str:
     cut_path = out_path + ".cut.mp4"
     try:
-        ranges, timing_map = _speech_ranges_from_transcript(transcript, start_time, end_time)
+        tighten_enabled, threshold, keep = _clip_pause_settings(highlight)
+        ranges, timing_map = _speech_ranges_from_transcript(
+            transcript,
+            start_time,
+            end_time,
+            tighten_enabled=tighten_enabled,
+            threshold_override=threshold,
+            keep_override=keep,
+        )
         _cut_tightened_subclip(source_path, ranges, cut_path)
         frame_mode = os.getenv("LOCAL_FRAME_MODE", "fit").strip().lower()
         user_log("Frame mode", frame_mode)
@@ -852,8 +935,8 @@ def crop_clip_local(
             _reframe_fit_blur(cut_path, out_path, aspect_ratio)
         subtitle_segments = _subtitle_segments(transcript, start_time, end_time, timing_map=timing_map)
         user_log("Subtitle timing", f"{len(subtitle_segments)} lines")
-        _burn_subtitles(out_path, subtitle_segments)
-        _write_render_sidecar(out_path, len(subtitle_segments), start_time, end_time, timing_map)
+        _burn_subtitles(out_path, subtitle_segments, highlight=highlight)
+        _write_render_sidecar(out_path, len(subtitle_segments), start_time, end_time, timing_map, highlight=highlight)
         _require_valid_video(out_path, "final clip")
     finally:
         if os.path.exists(cut_path):
@@ -890,6 +973,7 @@ def crop_highlights_local(
                     aspect_ratio,
                     out_path,
                     transcript=transcript,
+                    highlight=h,
                 )
             return (i - 1, {**h, "clip_url": out_path})
         except Exception as e:

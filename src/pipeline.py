@@ -6,10 +6,11 @@ All processing runs locally. OPENAI_API_KEY required for highlight analysis.
 import os
 import re
 import shutil
+import html
 from typing import Dict, List, Optional
 
 from .config import edit_profile, local_output_dir
-from .highlights import build_beat_map, build_episode_digest, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights, refine_highlight_boundaries_with_llm
+from .highlights import build_beat_map, build_episode_digest, decide_auto_clip_count, decide_edit_plan, final_quality_review_with_llm, get_highlights, keep_postable_highlights, refine_highlight_boundaries_with_llm
 
 
 def _snap_highlights_to_segments(highlights: List[Dict], transcript: Dict) -> List[Dict]:
@@ -69,6 +70,7 @@ TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
 BOUNDARY_REVIEW_VERSION = 2
 EPISODE_DIGEST_VERSION = 1
+FINAL_QUALITY_VERSION = 1
 
 
 def _norm_words(text: str) -> List[str]:
@@ -383,6 +385,82 @@ def _enforce_duration_cap(highlights: List[Dict], transcript: Dict) -> List[Dict
     return _complete_clip_boundaries(capped, transcript)
 
 
+def _write_upload_metadata(output_dir: str, shorts: List[Dict]) -> str:
+    from .local.session import write_json
+
+    metadata = []
+    for index, short in enumerate(shorts, 1):
+        clip_path = short.get("clip_url")
+        metadata.append({
+            "index": index,
+            "file": clip_path,
+            "title": short.get("title", f"short_{index:02d}"),
+            "titles": short.get("titles", []),
+            "description": short.get("description", ""),
+            "hashtags": short.get("hashtags", []),
+            "pinned_comment": short.get("pinned_comment", ""),
+            "viral_score": short.get("viral_score", short.get("score", 0)),
+            "score_matrix": short.get("score_matrix", {}),
+            "hook_sentence": short.get("hook_sentence", ""),
+            "intro_overlay": short.get("intro_overlay", ""),
+            "semantic_key": short.get("semantic_key", ""),
+            "reason": short.get("virality_reason", ""),
+            "start_time": short.get("start_time"),
+            "end_time": short.get("end_time"),
+            "error": short.get("error"),
+        })
+    path = os.path.join(output_dir, "upload_metadata.json")
+    write_json(path, {"clips": metadata})
+    return path
+
+
+def _write_contact_sheet(output_dir: str, shorts: List[Dict]) -> str:
+    rows = []
+    for index, short in enumerate(shorts, 1):
+        clip_path = short.get("clip_url") or ""
+        rel_clip = os.path.basename(clip_path) if clip_path else ""
+        titles = short.get("titles") if isinstance(short.get("titles"), list) else []
+        hashtags = short.get("hashtags") if isinstance(short.get("hashtags"), list) else []
+        matrix = short.get("score_matrix") if isinstance(short.get("score_matrix"), dict) else {}
+        rows.append(f"""
+<section class="clip">
+  <video src="{html.escape(rel_clip)}" controls preload="metadata"></video>
+  <div class="meta">
+    <h2>{index:02d}. {html.escape(str(short.get('title', 'Untitled')))}</h2>
+    <p><b>Score:</b> {html.escape(str(short.get('viral_score', short.get('score', 0))))}</p>
+    <p><b>Hook:</b> {html.escape(str(short.get('hook_sentence', '')))}</p>
+    <p><b>Overlay:</b> {html.escape(str(short.get('intro_overlay', '')))}</p>
+    <p><b>Why:</b> {html.escape(str(short.get('virality_reason', '')))}</p>
+    <p><b>Titles:</b> {html.escape(' | '.join(str(t) for t in titles))}</p>
+    <p><b>Description:</b> {html.escape(str(short.get('description', '')))}</p>
+    <p><b>Hashtags:</b> {html.escape(' '.join(str(t) for t in hashtags))}</p>
+    <p><b>Pinned:</b> {html.escape(str(short.get('pinned_comment', '')))}</p>
+    <p><b>Matrix:</b> {html.escape(json_dumps_compact(matrix))}</p>
+  </div>
+</section>""")
+    path = os.path.join(output_dir, "clips_review.html")
+    html_doc = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Shorts Review</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#111;color:#eee;margin:24px}}
+.clip{{display:grid;grid-template-columns:260px 1fr;gap:18px;margin:0 0 24px;padding:16px;border:1px solid #333;border-radius:8px;background:#181818}}
+video{{width:260px;max-height:460px;background:#000}}
+h2{{margin:0 0 10px;font-size:20px}} p{{margin:6px 0;line-height:1.35}} b{{color:#9ee}}
+@media(max-width:760px){{.clip{{grid-template-columns:1fr}}video{{width:100%;max-height:none}}}}
+</style></head><body>
+<h1>Shorts Review</h1>
+{''.join(rows)}
+</body></html>"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(html_doc)
+    return path
+
+
+def json_dumps_compact(data: Dict) -> str:
+    import json
+    return json.dumps(data or {}, ensure_ascii=False, separators=(",", ":"))
+
+
 def generate_shorts(
     video_url: str,
     num_clips: int = 0,
@@ -427,6 +505,7 @@ def generate_shorts(
     edit_plan_json = f"{session_path}/edit_plan.json"
     top_json = f"{session_path}/top.json"
     verified_top_json = f"{session_path}/verified_top.json"
+    final_quality_json = f"{session_path}/final_quality.json"
     result_json = f"{session_path}/result.json"
     user_log("Job folder", output_dir)
 
@@ -580,7 +659,7 @@ def generate_shorts(
     verified_top = verified_top_state.get("highlights") if verified_top_state else None
     if verified_top and (
         len(verified_top) >= num_clips or verified_top_state.get("quality_limited") is True
-    ) and verified_top_state.get("boundary_review_version") == BOUNDARY_REVIEW_VERSION:
+    ) and verified_top_state.get("boundary_review_version") == BOUNDARY_REVIEW_VERSION and verified_top_state.get("final_quality_version") == FINAL_QUALITY_VERSION:
         top = verified_top[:num_clips]
         user_log("Final picks ready", f"{len(top)} clips loaded from cache")
     else:
@@ -600,10 +679,23 @@ def generate_shorts(
         top = _apply_text_anchor_boundaries(top, transcript)
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
+        stage("Final quality gate", "checking hooks, duplicates, upload metadata, and render style")
+        top = final_quality_review_with_llm(
+            transcript,
+            top,
+            num_clips,
+            call_fast_llm,
+            episode_digest=episode_digest,
+            analysis_map=analysis_map,
+            cache_path=final_quality_json,
+        )
+        top = _snap_highlights_to_segments(top, transcript)
+        top = keep_postable_highlights(_enforce_duration_cap(top, transcript), min_score=82)
         write_json(verified_top_json, {
             "highlights": top,
             "quality_limited": len(top) < num_clips,
             "boundary_review_version": BOUNDARY_REVIEW_VERSION,
+            "final_quality_version": FINAL_QUALITY_VERSION,
         })
     if not top:
         user_log("No strong clips", "Final quality check rejected every candidate")
@@ -646,11 +738,16 @@ def generate_shorts(
             if os.path.abspath(clip_url) != os.path.abspath(public_path):
                 shutil.copy2(clip_url, public_path)
             short["clip_url"] = public_path
+    metadata_path = _write_upload_metadata(output_dir, shorts)
+    contact_sheet_path = _write_contact_sheet(output_dir, shorts)
+    user_log("Upload kit", f"metadata and review sheet saved: {os.path.basename(metadata_path)}, {os.path.basename(contact_sheet_path)}")
     result = {
         "source_video_url": source_path,
         "transcript": transcript,
         "highlights": all_highlights,
         "shorts": shorts,
+        "upload_metadata": metadata_path,
+        "contact_sheet": contact_sheet_path,
     }
     write_json(result_json, result)
 

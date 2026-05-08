@@ -91,6 +91,7 @@ def hydrate_from_matching_source(current_session_path: str, source_path: str) ->
             "edit_plan.json",
             "highlights.json",
             "top.json",
+            "final_quality.json",
             "verified_top.json",
         ):
             src = os.path.join(candidate_dir, filename)
