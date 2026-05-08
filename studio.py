@@ -329,13 +329,73 @@ class Api:
         return [s for s in sources if s]
 
     def _folder_name_for_source(self, source, index):
+        title = self._source_title(source)
+        if title:
+            return self._sanitize_folder_name(title, index)
+        return self._sanitize_folder_name(self._fallback_folder_name(source, index), index)
+
+    def _fallback_folder_name(self, source, index):
         parsed = urlparse(source)
         if parsed.scheme in {"http", "https"}:
-            candidate = unquote(Path(parsed.path).stem) or parsed.netloc or f"video_{index:02d}"
-        else:
-            candidate = Path(source).stem or f"video_{index:02d}"
-        candidate = re.sub(r"[<>:\"/\\|?*]+", "_", candidate).strip(" ._")
-        return candidate[:80] or f"video_{index:02d}"
+            return unquote(Path(parsed.path).stem) or parsed.netloc or f"video_{index:02d}"
+        return Path(source).stem or f"video_{index:02d}"
+
+    def _source_title(self, source):
+        parsed = urlparse(source)
+        if parsed.scheme not in {"http", "https"}:
+            return Path(source).stem if Path(source).stem else ""
+        try:
+            import yt_dlp  # type: ignore
+        except Exception:
+            return ""
+        try:
+            class QuietLogger:
+                def debug(self, _message):
+                    pass
+
+                def warning(self, _message):
+                    pass
+
+                def error(self, _message):
+                    pass
+
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "logger": QuietLogger(),
+            }) as ydl:
+                info = ydl.extract_info(source, download=False)
+            if isinstance(info, dict):
+                title = str(info.get("title") or "").strip()
+                if title:
+                    return title
+        except Exception:
+            print("[studio] Could not read video title, using URL name", flush=True)
+        return ""
+
+    def _sanitize_folder_name(self, value, index):
+        candidate = re.sub(r"[<>:\"/\\|?*]+", "_", str(value)).strip(" ._")
+        candidate = re.sub(r"\s+", " ", candidate)
+        reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        }
+        if not candidate or candidate.upper() in reserved:
+            candidate = f"video_{index:02d}"
+        return candidate[:90].rstrip(" ._") or f"video_{index:02d}"
+
+    def _job_output_dir(self, base_output_dir, source, index, total):
+        folder_name = self._folder_name_for_source(source, index)
+        if total > 1:
+            folder_name = f"{index:02d}_{folder_name}"
+        candidate = Path(base_output_dir) / folder_name
+        suffix = 2
+        while candidate.exists() and not candidate.is_dir():
+            candidate = Path(base_output_dir) / f"{folder_name}_{suffix}"
+            suffix += 1
+        return str(candidate)
 
     # ── Pipeline control ─────────────────────────────────────────────
     def start_job(self, settings):
@@ -370,12 +430,12 @@ class Api:
                 module_name = "".join(("s", "r", "c"))
                 generate_shorts = importlib.import_module(module_name).generate_shorts
                 base_output_dir = job_env["LOCAL_OUTPUT_DIR"]
+                Path(base_output_dir).mkdir(parents=True, exist_ok=True)
                 for index, source in enumerate(sources, 1):
                     if self._cancel:
                         raise RuntimeError("Stopped")
-                    item_output_dir = base_output_dir
-                    if len(sources) > 1:
-                        item_output_dir = str(Path(base_output_dir) / f"{index:02d}_{self._folder_name_for_source(source, index)}")
+                    item_output_dir = self._job_output_dir(base_output_dir, source, index, len(sources))
+                    Path(item_output_dir).mkdir(parents=True, exist_ok=True)
                     os.environ["LOCAL_OUTPUT_DIR"] = item_output_dir
                     print(f"[studio] batch {index}/{len(sources)} -> {item_output_dir}", flush=True)
                     generate_shorts(
