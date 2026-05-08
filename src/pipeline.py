@@ -68,11 +68,11 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
 
 TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
-BOUNDARY_REVIEW_VERSION = 4
+BOUNDARY_REVIEW_VERSION = 5
 EPISODE_DIGEST_VERSION = 1
-FINAL_QUALITY_VERSION = 3
-HIGHLIGHTS_CACHE_VERSION = 4
-TOP_SELECTION_VERSION = 3
+FINAL_QUALITY_VERSION = 4
+HIGHLIGHTS_CACHE_VERSION = 5
+TOP_SELECTION_VERSION = 4
 
 
 def _norm_words(text: str) -> List[str]:
@@ -699,15 +699,7 @@ def generate_shorts(
             cache_path=final_quality_json,
         )
         top = _snap_highlights_to_segments(top, transcript)
-        top = keep_postable_highlights(
-            _enforce_duration_cap(top, transcript),
-            min_score=68,
-            min_ending=50,
-            max_context_risk=92,
-            min_first_3s=45,
-            min_payoff=45,
-            min_shareability=40,
-        )
+        top = _enforce_duration_cap(top, transcript)
         write_json(verified_top_json, {
             "highlights": top,
             "quality_limited": len(top) < num_clips,

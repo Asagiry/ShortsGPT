@@ -23,12 +23,12 @@ from .local.session import read_json, write_json
 LLMFn = Callable[[str], str]
 
 MIN_POSTABLE_SCORE = 78
-HIGHLIGHT_SELECTION_VERSION = 4
-FINAL_QUALITY_REVIEW_VERSION = 3
+HIGHLIGHT_SELECTION_VERSION = 5
+FINAL_QUALITY_REVIEW_VERSION = 4
 
 
 CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
-Choose one: podcast, interview, tutorial, lecture, commentary, debate, vlog, other.
+Choose one: podcast, interview, tutorial, lecture, commentary, debate, vlog, animated_sitcom, scripted_comedy, movie_scene, gameplay, other.
 Also estimate content density: low (mostly filler/chit-chat), medium, or high (dense info/stories).
 Respond with JSON only: {"content_type": "...", "density": "..."}"""
 
@@ -145,7 +145,7 @@ What makes a good clip:
 - For scripted scenes/cartoons, a silent face reaction, object reveal, cutaway, or visual consequence can be the ending. Do not trim it just because nobody is speaking.
 - Self-contained context: a viewer who sees only this clip should understand why it matters.
 - Strong retention: remove obvious warm-up, filler, long pauses, and repeated phrases when they are not needed.
-- It should feel worth posting. If it is merely understandable but not funny, surprising, emotional, useful, tense, or shareable, reject it.
+- It should feel worth testing as a post. For early channel testing, usable comedy/story moments are acceptable even if not mathematically perfect.
 
 Duration guidance:
 - Prefer 18-45 seconds when that preserves the full idea.
@@ -165,6 +165,10 @@ Reject:
 - A clip that ends mid-thought, mid-answer, before the reaction/conclusion, or before the visual gag lands.
 - Multiple unrelated ideas forced into one clip.
 - Overlapping clips that say the same thing.
+
+Calibration:
+- Do not be so strict that a normal scripted comedy episode returns zero. Zero means the transcript truly has no complete usable moments or the transcript is unreadable.
+- A first season sitcom/cartoon pilot with clear jokes, reveals, reversals, or character moments should usually produce several testable shorts.
 """
 
 
@@ -214,8 +218,8 @@ Choose the best complete clips from the beats below.
 
 Rules:
 - Pick clips from beats with high clip_potential and standalone=true when possible.
-- Return fewer clips than requested when the batch is weak. Returning zero is correct for a weak batch.
-- Do not include average/filler moments just to increase output count.
+- Return fewer clips than requested when the batch is weak, but do not return zero if there are usable comedy/story moments.
+- Do not include empty filler, but include testable moments with a clear setup/reversal/payoff even if they are not perfect.
 - Preserve setup -> development -> payoff/reaction.
 - For scripted episodes, prefer moments that carry a complete mini-story: setup, character intention, conflict/reversal, and landing.
 - Do not pick isolated punchlines, random exposition, or half-scenes just because the line is funny.
@@ -243,7 +247,7 @@ Treat {num_clips} as a hard maximum, not a target. Keep only clips that are comp
 
 Rules:
 - Select 0-{num_clips} clips. Fewer is better than filler.
-- Reject average clips even if that means the final output has only a few shorts.
+- Reject true filler, but keep testable scripted-comedy moments that have a clear setup, turn, and landing.
 - Keep only clips with a strong hook and clear payoff/reaction/reveal/conflict/useful takeaway.
 - Prefer complete setup -> payoff/reaction clips.
 - Do not choose overlapping clips.
@@ -251,6 +255,45 @@ Rules:
 - If preserving the final reaction requires trimming, move start_time later rather than cutting end_time earlier.
 - Keep clips around 10-60 seconds; 61-75 seconds is allowed only when needed for a complete ending.
 - You may adjust start_time/end_time slightly to clean boundaries.
+
+Respond JSON only:
+{{"selected":[{{"id":int,"start_time":float,"end_time":float,"score":int,"reason":"..."}}]}}
+
+Candidates:
+{candidates_json}"""
+
+
+RECOVERY_BEAT_SELECTION_PROMPT = """The previous strict selection pass returned zero clips.
+
+Re-evaluate the story beats with a practical short-form testing mindset.
+This is not a final viral guarantee. The goal is to choose clips that are worth rendering and reviewing.
+
+Episode editorial brief:
+{episode_context}
+
+Rules:
+- Choose up to {num_clips} usable clips from these beats.
+- Zero is allowed only if none of the beats has a complete setup -> turn/payoff/reaction.
+- For animated sitcoms/scripted comedy, accept moments with clear absurdity, reversal, character conflict, reveal, or joke landing.
+- Prefer complete context and clean endings over perfect hook intensity.
+- Do not invent moments outside the given beats.
+
+Respond JSON only:
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","score_matrix":{{"hook":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"shareability":0,"context_loss_risk":0}}}}]}}
+
+Beats:
+{beat_map_json}"""
+
+
+RECOVERY_CANDIDATE_SELECTION_PROMPT = """The previous final review returned zero clips.
+
+Re-evaluate these candidates as a practical editor preparing a test batch.
+Do not force clips, but do not demand perfection. Keep candidates that are coherent, complete, and worth manually reviewing.
+
+Rules:
+- Select up to {num_clips}.
+- Zero only if every candidate is confusing, incomplete, duplicate filler, or impossible to make coherent.
+- For scripted comedy, a usable joke/reveal/reversal/character-conflict scene is enough for a test render.
 
 Respond JSON only:
 {{"selected":[{{"id":int,"start_time":float,"end_time":float,"score":int,"reason":"..."}}]}}
@@ -292,9 +335,9 @@ For each kept clip:
 - Provide semantic_key, a short meaning label used to remove duplicate ideas.
 
 Hard quality gate:
-- Keep clips with viral_score >= 70.
+- Prefer clips with viral_score >= 70, but keep lower-scored clips if they are coherent and worth test-rendering.
 - Reject clips with weak first 3 seconds, missing setup, missing payoff, unclear context, duplicated meaning, or ending before the thought lands.
-- If only 2 clips are great, keep 2. If none are great, keep none.
+- If only 2 clips are usable, keep 2. If none are usable, keep none.
 
 Respond JSON only:
 {{"clips":[{{"id":int,"keep":true,"start_time":float,"end_time":float,"viral_score":int,"score_matrix":{{"hook":0,"first_3s":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"shareability":0,"rewatch_potential":0,"context_loss_risk":0}},"semantic_key":"...","intro_overlay":"...","hook_sentence":"...","pause_policy":"balanced","highlight_keywords":["..."],"titles":["...","...","..."],"description":"...","hashtags":["#..."],"pinned_comment":"...","reason":"..."}}]}}
@@ -450,56 +493,92 @@ def _parse_beats(data: Dict) -> List[Dict]:
     return beats
 
 
-def _fallback_highlights_from_beats(beats: List[Dict], num_clips: int, reason: str = "LLM returned zero candidates") -> List[Dict]:
-    fallback: List[Dict] = []
-    ranked = sorted(
-        beats,
-        key=lambda b: (
-            int(b.get("clip_potential", 0) or 0),
-            1 if b.get("standalone") else 0,
-            float(b.get("end_time", 0.0)) - float(b.get("start_time", 0.0)),
-        ),
-        reverse=True,
+def _recover_highlights_from_beats(
+    beats: List[Dict],
+    num_clips: int,
+    llm_fn: LLMFn,
+    episode_digest: Optional[Dict] = None,
+) -> List[Dict]:
+    if not beats or num_clips <= 0:
+        return []
+    ranked = sorted(beats, key=lambda b: int(b.get("clip_potential", 0) or 0), reverse=True)
+    review_beats = ranked[: max(10, min(len(ranked), num_clips * 4))]
+    prompt = RECOVERY_BEAT_SELECTION_PROMPT.format(
+        episode_context=_episode_context_text(episode_digest),
+        num_clips=num_clips,
+        beat_map_json=json.dumps({"beats": review_beats}, ensure_ascii=False, separators=(",", ":"))[:22000],
     )
-    for beat in ranked:
+    user_log("LLM recovery review", f"rechecking {len(review_beats)} story beats after zero candidates")
+    data = _parse_json_loose(llm_fn(prompt))
+    recovered = dedupe_highlights(data.get("highlights", []))
+    recovered = keep_postable_highlights(
+        recovered,
+        min_score=50,
+        min_ending=35,
+        max_context_risk=98,
+        min_first_3s=30,
+        min_payoff=30,
+        min_shareability=25,
+    )
+    user_log("LLM recovery review", f"{len(recovered)} clips recovered from story beats")
+    return recovered[:num_clips]
+
+
+def _recover_selected_candidates(
+    candidates: List[Dict],
+    num_clips: int,
+    llm_fn: LLMFn,
+) -> List[Dict]:
+    if not candidates or num_clips <= 0:
+        return []
+    review_items = []
+    for index, item in enumerate(candidates[: max(num_clips * 3, 12)], 1):
+        review_items.append({
+            "id": index,
+            "title": item.get("title", ""),
+            "start_time": float(item.get("start_time", 0.0)),
+            "end_time": float(item.get("end_time", 0.0)),
+            "score": int(item.get("score", 0) or 0),
+            "hook_sentence": item.get("hook_sentence", ""),
+            "virality_reason": item.get("virality_reason", ""),
+            "score_matrix": item.get("score_matrix", {}),
+        })
+    prompt = RECOVERY_CANDIDATE_SELECTION_PROMPT.format(
+        num_clips=num_clips,
+        candidates_json=json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:18000],
+    )
+    user_log("LLM recovery review", f"rechecking {len(review_items)} candidates after zero final picks")
+    data = _parse_json_loose(llm_fn(prompt))
+    by_id = {i + 1: h for i, h in enumerate(candidates)}
+    selected = []
+    for item in data.get("selected", []):
         try:
-            start = float(beat.get("start_time", 0.0))
-            end = float(beat.get("end_time", 0.0))
+            cid = int(item.get("id", 0) or 0)
         except (TypeError, ValueError):
             continue
-        if end <= start:
+        if cid not in by_id:
             continue
-        if end - start < 10.0:
-            end = start + 10.0
-        if end - start > 75.0:
-            end = start + 75.0
-        potential = int(beat.get("clip_potential", 0) or 0)
-        score = max(68, min(88, potential if potential else 72))
-        title = _compact_text(str(beat.get("summary") or beat.get("payoff") or "Episode moment"), 70)
-        fallback.append({
-            "title": title,
-            "start_time": start,
-            "end_time": end,
-            "score": score,
-            "viral_score": score,
-            "hook_sentence": _compact_text(str(beat.get("setup") or title), 120),
-            "virality_reason": f"{reason}; kept from story beat: {_compact_text(str(beat.get('payoff') or beat.get('summary') or ''), 180)}",
-            "semantic_key": _compact_text(str(beat.get("summary") or title).casefold(), 90),
-            "score_matrix": {
-                "hook": score,
-                "first_3s": max(60, score - 5),
-                "standalone_clarity": 70 if beat.get("standalone") else 60,
-                "setup_completeness": 70,
-                "payoff_strength": max(62, score - 4),
-                "ending_completeness": 70,
-                "shareability": max(58, score - 8),
-                "rewatch_potential": 58,
-                "context_loss_risk": 35 if beat.get("standalone") else 55,
-            },
-        })
-        if len(fallback) >= max(1, min(num_clips, 4)):
-            break
-    return fallback
+        h = dict(by_id[cid])
+        try:
+            h["start_time"] = float(item.get("start_time", h.get("start_time", 0.0)))
+            h["end_time"] = float(item.get("end_time", h.get("end_time", 0.0)))
+            h["score"] = int(item.get("score", h.get("score", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if item.get("reason"):
+            h["virality_reason"] = str(item.get("reason"))
+        selected.append(h)
+    selected = keep_postable_highlights(
+        dedupe_highlights(selected),
+        min_score=50,
+        min_ending=35,
+        max_context_risk=98,
+        min_first_3s=30,
+        min_payoff=30,
+        min_shareability=25,
+    )
+    user_log("LLM recovery review", f"{len(selected)} clips recovered from candidates")
+    return selected[:num_clips]
 
 
 def build_transcript_sample(transcript: Dict, max_chars: int = 14000) -> str:
@@ -965,12 +1044,12 @@ def call_highlight_api_from_beats(
         min_shareability=35,
     )
     if not candidates:
-        candidates = _fallback_highlights_from_beats(
+        candidates = _recover_highlights_from_beats(
             sorted_beats,
             num_clips,
-            reason="LLM candidate batches returned zero usable clips",
+            review_llm_fn or llm_fn,
+            episode_digest=episode_digest,
         )
-        user_log("GPT clip candidates", f"LLM returned 0 usable candidates; using {len(candidates)} best story beats")
     if not candidates:
         result = {"version": HIGHLIGHT_SELECTION_VERSION, "highlights": [], "complete": True, "batches": completed_batches}
         if cache_path:
@@ -1013,8 +1092,7 @@ def call_highlight_api_from_beats(
         if int(h.get("score", 0) or 0) >= 65:
             selected.append(h)
     if not selected:
-        selected = top_candidates[: max(1, min(num_clips, 4))]
-        user_log("LLM final review", f"returned 0 clips; using {len(selected)} best candidates instead")
+        selected = _recover_selected_candidates(top_candidates, num_clips, review_llm_fn or llm_fn)
     result = {
         "version": HIGHLIGHT_SELECTION_VERSION,
         "highlights": keep_postable_highlights(
@@ -1103,37 +1181,6 @@ def keep_postable_highlights(
             continue
         kept.append(h)
     return kept
-
-
-def _fallback_quality_clip(h: Dict, index: int) -> Dict:
-    clip = dict(h)
-    base_title = str(clip.get("title") or f"Clip {index}")
-    score = int(clip.get("viral_score", clip.get("score", 70)) or 70)
-    clip["viral_score"] = max(score, 70)
-    clip["score"] = max(int(clip.get("score", 0) or 0), clip["viral_score"])
-    clip.setdefault("semantic_key", _compact_text(base_title.casefold(), 90))
-    clip.setdefault("intro_overlay", "")
-    clip.setdefault("hook_sentence", str(clip.get("hook_sentence") or base_title))
-    clip.setdefault("pause_policy", "balanced")
-    clip.setdefault("highlight_keywords", [])
-    clip.setdefault("titles", [base_title, base_title[:70], base_title[:55]])
-    clip.setdefault("description", str(clip.get("virality_reason") or "A complete short-worthy moment from the episode."))
-    clip.setdefault("hashtags", ["#shorts"])
-    clip.setdefault("pinned_comment", "Which moment was better?")
-    clip.setdefault("score_matrix", {
-        "hook": 70,
-        "first_3s": 70,
-        "standalone_clarity": 70,
-        "setup_completeness": 70,
-        "payoff_strength": 70,
-        "ending_completeness": 70,
-        "shareability": 70,
-        "rewatch_potential": 65,
-        "context_loss_risk": 25,
-    })
-    if not clip.get("virality_reason"):
-        clip["virality_reason"] = "Kept by fallback because the episode has usable candidates and quality gate should not zero the batch."
-    return clip
 
 
 def final_quality_review_with_llm(
@@ -1233,17 +1280,23 @@ def final_quality_review_with_llm(
 
     selected = keep_postable_highlights(
         dedupe_highlights(selected),
-        min_score=68,
-        min_ending=50,
-        max_context_risk=92,
-        min_first_3s=45,
-        min_payoff=45,
-        min_shareability=40,
+        min_score=50,
+        min_ending=30,
+        max_context_risk=99,
+        min_first_3s=25,
+        min_payoff=25,
+        min_shareability=20,
     )
     if not selected and source_candidates:
-        fallback_count = min(num_clips, max(1, min(3, len(source_candidates))))
-        selected = [_fallback_quality_clip(h, i + 1) for i, h in enumerate(source_candidates[:fallback_count])]
-        user_log("Final quality review", f"quality gate kept 0, using {len(selected)} best candidates instead of skipping the episode")
+        selected = _recover_selected_candidates(source_candidates, num_clips, llm_fn)
+        for h in selected:
+            h.setdefault("intro_overlay", "")
+            h.setdefault("pause_policy", "balanced")
+            h.setdefault("highlight_keywords", [])
+            h.setdefault("titles", [str(h.get("title") or "Short")])
+            h.setdefault("description", str(h.get("virality_reason") or "A testable short-form moment from the episode."))
+            h.setdefault("hashtags", ["#shorts"])
+            h.setdefault("pinned_comment", "")
     selected = sorted(selected, key=lambda h: int(h.get("viral_score", h.get("score", 0)) or 0), reverse=True)[:num_clips]
     user_log("Final quality review", f"{len(selected)} clips passed the upload-quality gate")
     if cache_path:
@@ -1462,12 +1515,12 @@ def get_highlights(
         )
         highlights = dedupe_highlights(result.get("highlights", []))
         if not highlights:
-            highlights = _fallback_highlights_from_beats(
+            highlights = _recover_highlights_from_beats(
                 beat_map.get("beats", []),
                 num_clips,
-                reason="Beat-map selection returned zero clips",
+                review_llm_fn or llm_fn,
+                episode_digest=episode_digest,
             )
-            user_log("Beat map selection", f"using {len(highlights)} fallback clips from best story beats")
         return {"highlights": highlights, "beat_map_source": beat_map.get("source")}
 
     if duration >= LONG_VIDEO_THRESHOLD:
