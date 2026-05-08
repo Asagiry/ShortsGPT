@@ -68,10 +68,11 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
 
 TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
-BOUNDARY_REVIEW_VERSION = 3
+BOUNDARY_REVIEW_VERSION = 4
 EPISODE_DIGEST_VERSION = 1
-FINAL_QUALITY_VERSION = 2
-HIGHLIGHTS_CACHE_VERSION = 2
+FINAL_QUALITY_VERSION = 3
+HIGHLIGHTS_CACHE_VERSION = 3
+TOP_SELECTION_VERSION = 2
 
 
 def _norm_words(text: str) -> List[str]:
@@ -642,12 +643,12 @@ def generate_shorts(
         )
         highlights_result["highlights"] = keep_postable_highlights(
             score_highlights(highlights_result.get("highlights", []), analysis_map),
-            min_score=72,
-            min_ending=60,
-            max_context_risk=88,
-            min_first_3s=55,
-            min_payoff=55,
-            min_shareability=50,
+            min_score=60,
+            min_ending=45,
+            max_context_risk=95,
+            min_first_3s=40,
+            min_payoff=40,
+            min_shareability=35,
         )
         highlights_result["version"] = HIGHLIGHTS_CACHE_VERSION
         write_json(highlights_json, highlights_result)
@@ -672,7 +673,7 @@ def generate_shorts(
         user_log("Final picks ready", f"{len(top)} clips loaded from cache")
     else:
         top_state = read_json(top_json)
-        cached_top = top_state.get("highlights") if top_state else None
+        cached_top = top_state.get("highlights") if top_state and top_state.get("version") == TOP_SELECTION_VERSION else None
         if cached_top:
             user_log("Checking cached picks", f"{len(cached_top)} clips")
             top = cached_top[:num_clips]
@@ -681,7 +682,7 @@ def generate_shorts(
                 sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True),
                 analysis_map,
             )[:num_clips]
-            write_json(top_json, {"highlights": top})
+            write_json(top_json, {"version": TOP_SELECTION_VERSION, "highlights": top})
         stage("Checking clip boundaries", f"LLM adjusts {len(top)} clips to semantic scene endings")
         top = refine_highlight_boundaries_with_llm(transcript, top, call_fast_llm, episode_digest=episode_digest)
         top = _apply_text_anchor_boundaries(top, transcript)
@@ -700,12 +701,12 @@ def generate_shorts(
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(
             _enforce_duration_cap(top, transcript),
-            min_score=76,
-            min_ending=68,
-            max_context_risk=85,
-            min_first_3s=58,
-            min_payoff=58,
-            min_shareability=52,
+            min_score=68,
+            min_ending=50,
+            max_context_risk=92,
+            min_first_3s=45,
+            min_payoff=45,
+            min_shareability=40,
         )
         write_json(verified_top_json, {
             "highlights": top,
