@@ -74,15 +74,27 @@ export default function App() {
   }, []);
 
   const updateProgress = useCallback((line: string) => {
-    if (line.includes('[transcribe]') && line.includes('%')) {
+    if (line.includes('Preparing source') || line.includes('Source ready') || line.includes('Job folder')) {
+      setProgress(v => Math.max(v, 3)); setStatusText('Preparing source'); setActiveStep(0);
+    } else if (line.includes('Transcript ready') || line.includes('loaded from cache')) {
+      setProgress(v => Math.max(v, 35)); setStatusText('Transcript loaded'); setActiveStep(1);
+    } else if (line.includes('Media analysis ready') || line.includes('Analyzing video and audio')) {
+      setProgress(v => Math.max(v, 37)); setStatusText('Analyzing media'); setActiveStep(2);
+    } else if (line.includes('[transcribe]') && line.includes('%')) {
       try { const p = parseFloat(line.split('%')[0].split(/\s+/).pop() || '0'); setProgress(v => Math.max(v, Math.min(35, p * 0.35))); setStatusText(`Transcribing ${p.toFixed(1)}%`); setActiveStep(1); } catch {}
-    } else if (line.includes('Planning edit rhythm')) { setProgress(38); setStatusText('Planning edit rhythm'); setActiveStep(2); }
-    else if (line.includes('Planning clip count')) { setProgress(40); setStatusText('Planning clip count'); setActiveStep(2); }
-    else if (line.includes('Building beat map')) { setProgress(44); setStatusText('Building beat map'); setActiveStep(3); }
-    else if (line.includes('Finding highlight')) { setProgress(48); setStatusText('Finding highlights'); setActiveStep(3); }
-    else if (line.includes('Verifying best moments')) { setProgress(58); setStatusText('Verifying best moments'); setActiveStep(4); }
-    else if (line.includes('Rendering shorts')) { setProgress(68); setStatusText('Rendering shorts'); setActiveStep(5); }
-    else if (line.includes('[clip/local] short')) {
+    } else if (line.includes('Choosing edit style') || line.includes('Edit style selected')) { setProgress(v => Math.max(v, 38)); setStatusText('Choosing edit style'); setActiveStep(2); }
+    else if (line.includes('Planning clip count') || line.includes('Clip count')) { setProgress(v => Math.max(v, 40)); setStatusText('Planning clip count'); setActiveStep(2); }
+    else if (line.includes('GPT story mapping') || line.includes('GPT story map') || line.includes('Story beats')) { setProgress(v => Math.max(v, 44)); setStatusText('Mapping story beats'); setActiveStep(3); }
+    else if (line.includes('[LLM story beats]') && line.includes('%')) {
+      try { const p = parseFloat(line.split('%')[0].split(/\s+/).pop() || '0'); setProgress(v => Math.max(v, 44 + Math.min(10, p * 0.10))); setStatusText(`Mapping story beats ${p.toFixed(0)}%`); setActiveStep(3); } catch {}
+    }
+    else if (line.includes('GPT clip selection') || line.includes('GPT clip candidates') || line.includes('Candidates')) { setProgress(v => Math.max(v, 54)); setStatusText('Selecting candidates'); setActiveStep(3); }
+    else if (line.includes('[LLM candidates]') && line.includes('%')) {
+      try { const p = parseFloat(line.split('%')[0].split(/\s+/).pop() || '0'); setProgress(v => Math.max(v, 54 + Math.min(8, p * 0.08))); setStatusText(`Selecting candidates ${p.toFixed(0)}%`); setActiveStep(3); } catch {}
+    }
+    else if (line.includes('LLM final review') || line.includes('LLM waiting') || line.includes('Checking clip boundaries') || line.includes('Final boundary check')) { setProgress(v => Math.max(v, 63)); setStatusText('Final LLM review'); setActiveStep(4); }
+    else if (line.includes('Rendering shorts') || line.includes('Rendering short')) { setProgress(v => Math.max(v, 68)); setStatusText('Rendering shorts'); setActiveStep(5); }
+    else if (line.includes('[clip/local] short') || line.includes('Rendering short')) {
       try { const m = line.match(/short\s+(\d+)\/(\d+)/); if (m) { const c = +m[1], t = +m[2]; setProgress(68 + ((c-1)/Math.max(t,1))*28); setStatusText(`Rendering short ${c}/${t}`); } } catch {}
     }
   }, []);

@@ -5,6 +5,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from ..config import llm_base_url, llm_beat_model, llm_fast_model, llm_model, llm_strong_model, require_openai_key
 from .progress import user_log
@@ -116,7 +117,21 @@ def _call_llm(prompt: str, model_name: str) -> str:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            return _call_llm_once(prompt, model_name, timeout)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_call_llm_once, prompt, model_name, timeout)
+                started = time.time()
+                last_wait_log = 0.0
+                while True:
+                    try:
+                        return future.result(timeout=15)
+                    except FutureTimeout:
+                        elapsed = int(time.time() - started)
+                        if elapsed - last_wait_log >= 30:
+                            last_wait_log = elapsed
+                            user_log(
+                                "LLM waiting",
+                                f"{model_name}: {elapsed}s elapsed, timeout {timeout}s, attempt {attempt}/{retries}",
+                            )
         except (RuntimeError, urllib.error.URLError, socket.timeout, TimeoutError) as e:
             last_error = e
             if attempt >= retries or not _is_retryable_error(e):

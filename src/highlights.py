@@ -788,7 +788,7 @@ def call_highlight_api_from_beats(
         num_clips=num_clips,
         candidates_json=json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:18000],
     )
-    user_log("LLM final review", f"choosing up to {num_clips} clips from {len(top_candidates)} candidates")
+    user_log("LLM final review", f"choosing best clips from {len(top_candidates)} candidates (AUTO max {num_clips})")
     data = _parse_json_loose((review_llm_fn or llm_fn)(prompt))
     selected = []
     by_id = {i + 1: h for i, h in enumerate(top_candidates)}
