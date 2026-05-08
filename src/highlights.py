@@ -83,6 +83,7 @@ BEAT_MAP_PROMPT = """You are making an editorial beat map from a timestamped tra
 
 Do not select final clips yet. First divide the transcript into complete meaning units.
 A beat is a self-contained story moment, joke setup/payoff, argument, reveal, conflict, reaction, lesson, or scene turn.
+For scripted shows, read it like an editor who understands the episode: character goal, conflict, reversal, joke setup, payoff, and what the scene means in the story.
 
 For each beat:
 - start_time: where necessary setup begins
@@ -98,6 +99,7 @@ For each beat:
 
 Rules:
 - Prefer complete beats over tiny transcript fragments.
+- Preserve the scene's purpose. A clip should not be just a funny line if the viewer needs the setup or the aftermath to understand why it matters.
 - For comedy/cartoon/dialogue, include the reaction after the punchline when it matters.
 - If the transcript goes quiet after a line but the beat likely continues visually, include that visual/reaction tail in end_time.
 - A beat can be longer than 60 seconds; final clipping will choose sub-beats later.
@@ -187,6 +189,8 @@ Rules:
 - Return fewer clips than requested when the batch is weak. Returning zero is correct for a weak batch.
 - Do not include average/filler moments just to increase output count.
 - Preserve setup -> development -> payoff/reaction.
+- For scripted episodes, prefer moments that carry a complete mini-story: setup, character intention, conflict/reversal, and landing.
+- Do not pick isolated punchlines, random exposition, or half-scenes just because the line is funny.
 - If a beat is longer than 75 seconds, choose a smaller complete sub-beat inside it.
 - Never end in the middle of a sentence, answer, joke, reaction, or boundary_note.
 - Never shorten a clip by cutting off the last reaction, rebuttal, object reveal, or visual landing.

@@ -8,7 +8,7 @@ import shutil
 from typing import Dict, List, Optional
 
 from .config import edit_profile, local_output_dir
-from .highlights import build_beat_map, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights, verify_highlights_with_llm
+from .highlights import build_beat_map, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights
 
 
 def _snap_highlights_to_segments(highlights: List[Dict], transcript: Dict) -> List[Dict]:
@@ -143,6 +143,30 @@ def _extend_to_min_duration_clean(start: float, end: float, segments: List[Dict]
     return min(end, duration) if duration > 0 else end
 
 
+def _extend_dialogue_tail(segments: List[Dict], start: float, end: float, max_end: float, duration: float) -> float:
+    tail_limit = min(max_end, end + 8.0)
+    current_end = end
+    for index, segment in enumerate(segments):
+        seg_start = float(segment["start"])
+        seg_end = float(segment["end"])
+        if seg_end <= current_end + 0.05:
+            continue
+        if seg_start > current_end + 1.15 or seg_end > tail_limit:
+            break
+        if seg_end - start < 10.0:
+            current_end = seg_end + 0.25
+            continue
+        current_end = seg_end + 0.35
+        next_start = float(segments[index + 1]["start"]) if index + 1 < len(segments) else duration
+        if next_start - seg_end >= 0.95:
+            break
+        if current_end - end >= 4.0 and _ends_like_sentence(segment.get("text", "")):
+            break
+    if duration > 0:
+        current_end = min(current_end, duration)
+    return current_end
+
+
 def _natural_end_before_cap(start: float, end: float, transcript: Dict) -> Optional[float]:
     segments = transcript.get("segments", [])
     limit = _clip_limit_seconds()
@@ -214,6 +238,7 @@ def _complete_clip_boundaries(highlights: List[Dict], transcript: Dict) -> List[
                     break
 
         end = _word_boundary_end(segments, start, end, max_end, duration)
+        end = _extend_dialogue_tail(segments, start, end, max_end, duration)
         if duration > 0:
             end = min(end, duration)
         if end - start > limit:
@@ -288,7 +313,7 @@ def generate_shorts(
     """
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
-    from .local.llm import call_beat_llm, call_fast_llm, call_strong_llm
+    from .local.llm import call_beat_llm, call_fast_llm
     from .local.media_analysis import build_analysis_map, score_highlights
     from .local.progress import stage, user_log
     from .local.session import hydrate_from_matching_source, hydrate_latest_transcript, read_json, session_dir, write_json
@@ -416,7 +441,7 @@ def generate_shorts(
             transcript,
             num_clips=num_clips,
             llm_fn=call_beat_llm,
-            review_llm_fn=call_strong_llm,
+            review_llm_fn=call_fast_llm,
             beat_map=beat_map,
             analysis_map=analysis_map,
             cache_path=highlights_json,
@@ -449,15 +474,14 @@ def generate_shorts(
         cached_top = top_state.get("highlights") if top_state else None
         if cached_top:
             user_log("Checking cached picks", f"{len(cached_top)} clips")
-            verifier_candidates = cached_top
+            top = cached_top[:num_clips]
         else:
-            verifier_candidates = score_highlights(
+            top = score_highlights(
                 sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True),
                 analysis_map,
-            )
-            write_json(top_json, {"highlights": verifier_candidates})
-        stage("Checking clip boundaries", f"making sure {num_clips} clips end on complete thoughts")
-        top = verify_highlights_with_llm(transcript, verifier_candidates, num_clips, call_strong_llm)
+            )[:num_clips]
+            write_json(top_json, {"highlights": top})
+        stage("Checking clip boundaries", f"expanding {len(top)} clips to clean phrase endings")
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
         write_json(verified_top_json, {"highlights": top, "quality_limited": len(top) < num_clips})
