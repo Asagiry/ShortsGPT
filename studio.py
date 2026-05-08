@@ -193,6 +193,21 @@ class Api:
                 or env_file.get("OPENAI_MODEL")
                 or "gpt-4o-mini"
             ),
+            "llm_fast_model": (
+                os.environ.get("LLM_FAST_MODEL")
+                or env_file.get("LLM_FAST_MODEL")
+                or ""
+            ),
+            "llm_beat_model": (
+                os.environ.get("LLM_BEAT_MODEL")
+                or env_file.get("LLM_BEAT_MODEL")
+                or ""
+            ),
+            "llm_strong_model": (
+                os.environ.get("LLM_STRONG_MODEL")
+                or env_file.get("LLM_STRONG_MODEL")
+                or ""
+            ),
         }
         for key, value in defaults.items():
             if not str(data.get(key, "")).strip() and value:
@@ -214,6 +229,9 @@ class Api:
             "LLM_API_KEY": str(data.get("llm_api_key", "")).strip(),
             "LLM_BASE_URL": str(data.get("llm_base_url", "")).strip(),
             "LLM_MODEL": str(data.get("llm_model", "")).strip(),
+            "LLM_FAST_MODEL": str(data.get("llm_fast_model", "")).strip(),
+            "LLM_BEAT_MODEL": str(data.get("llm_beat_model", "")).strip(),
+            "LLM_STRONG_MODEL": str(data.get("llm_strong_model", "")).strip(),
             "OPENAI_API_KEY": str(data.get("llm_api_key", "")).strip(),
             "OPENAI_BASE_URL": str(data.get("llm_base_url", "")).strip(),
             "OPENAI_MODEL": str(data.get("llm_model", "")).strip(),
@@ -265,6 +283,9 @@ class Api:
         llm_api_key = str(settings.get("llm_api_key", "")).strip()
         llm_base_url = str(settings.get("llm_base_url", "")).strip()
         llm_model = str(settings.get("llm_model", "")).strip()
+        llm_fast_model = str(settings.get("llm_fast_model", "")).strip()
+        llm_beat_model = str(settings.get("llm_beat_model", "")).strip()
+        llm_strong_model = str(settings.get("llm_strong_model", "")).strip()
         env_file = self._read_env_file()
         whisper_device = env_file.get("LOCAL_WHISPER_DEVICE", "").strip()
         stt_provider = env_file.get("STT_PROVIDER", "").strip()
@@ -272,6 +293,9 @@ class Api:
         llm_api_key = llm_api_key or env_file.get("LLM_API_KEY", "") or env_file.get("OPENAI_API_KEY", "")
         llm_base_url = llm_base_url or env_file.get("LLM_BASE_URL", "") or env_file.get("OPENAI_BASE_URL", "")
         llm_model = llm_model or env_file.get("LLM_MODEL", "") or env_file.get("OPENAI_MODEL", "")
+        llm_fast_model = llm_fast_model or env_file.get("LLM_FAST_MODEL", "")
+        llm_beat_model = llm_beat_model or env_file.get("LLM_BEAT_MODEL", "")
+        llm_strong_model = llm_strong_model or env_file.get("LLM_STRONG_MODEL", "")
         if whisper_device:
             env["LOCAL_WHISPER_DEVICE"] = whisper_device
         if stt_provider:
@@ -287,6 +311,12 @@ class Api:
         if llm_model:
             env["LLM_MODEL"] = llm_model
             env["OPENAI_MODEL"] = llm_model
+        if llm_fast_model:
+            env["LLM_FAST_MODEL"] = llm_fast_model
+        if llm_beat_model:
+            env["LLM_BEAT_MODEL"] = llm_beat_model
+        if llm_strong_model:
+            env["LLM_STRONG_MODEL"] = llm_strong_model
         return env
 
     def _sources_from_settings(self, settings):

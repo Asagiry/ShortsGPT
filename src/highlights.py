@@ -687,6 +687,7 @@ def call_highlight_api_from_beats(
     content_info: Dict,
     num_clips: int,
     llm_fn: LLMFn = None,
+    review_llm_fn: Optional[LLMFn] = None,
     analysis_map: Optional[Dict] = None,
     cache_path: Optional[str] = None,
 ) -> Dict:
@@ -788,7 +789,7 @@ def call_highlight_api_from_beats(
         candidates_json=json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:18000],
     )
     user_log("LLM final review", f"choosing up to {num_clips} clips from {len(top_candidates)} candidates")
-    data = _parse_json_loose(llm_fn(prompt))
+    data = _parse_json_loose((review_llm_fn or llm_fn)(prompt))
     selected = []
     by_id = {i + 1: h for i, h in enumerate(top_candidates)}
     for item in data.get("selected", []):
@@ -931,6 +932,7 @@ def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
     llm_fn: Optional[LLMFn] = None,
+    review_llm_fn: Optional[LLMFn] = None,
     beat_map: Optional[Dict] = None,
     analysis_map: Optional[Dict] = None,
     cache_path: Optional[str] = None,
@@ -955,6 +957,7 @@ def get_highlights(
             content_info,
             num_clips=num_clips,
             llm_fn=llm_fn,
+            review_llm_fn=review_llm_fn,
             analysis_map=analysis_map,
             cache_path=cache_path,
         )

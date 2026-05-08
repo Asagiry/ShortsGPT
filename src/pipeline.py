@@ -211,7 +211,7 @@ def generate_shorts(
     """
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
-    from .local.llm import call_openai_llm
+    from .local.llm import call_beat_llm, call_fast_llm, call_strong_llm
     from .local.media_analysis import build_analysis_map, score_highlights
     from .local.progress import stage, user_log
     from .local.session import hydrate_from_matching_source, hydrate_latest_transcript, read_json, session_dir, write_json
@@ -275,7 +275,7 @@ def generate_shorts(
     stage("Choosing edit style", f"profile setting: {requested_edit_profile}")
     edit_plan = read_json(edit_plan_json)
     if not edit_plan or edit_plan.get("requested_profile") != requested_edit_profile:
-        edit_plan = decide_edit_plan(transcript, call_openai_llm, requested_profile=requested_edit_profile)
+        edit_plan = decide_edit_plan(transcript, call_fast_llm, requested_profile=requested_edit_profile)
         edit_plan["requested_profile"] = requested_edit_profile
         write_json(edit_plan_json, edit_plan)
     pause_mode = "pause cuts on" if edit_plan.get("tighten_pauses") else "pause cuts off"
@@ -293,7 +293,7 @@ def generate_shorts(
             user_log("Clip count", f"{num_clips} shorts loaded from cache")
         else:
             stage("Planning clip count", "OpenAI LLM decides AUTO")
-            auto_plan = decide_auto_clip_count(transcript, call_openai_llm)
+            auto_plan = decide_auto_clip_count(transcript, call_fast_llm)
             num_clips = int(auto_plan["num_clips"])
             write_json(auto_plan_json, auto_plan)
             user_log("Clip count", f"{num_clips} shorts planned")
@@ -318,7 +318,7 @@ def generate_shorts(
             user_log("Story beats resume", f"{int(beat_map.get('completed_chunks', 0) or 0)} chunks already saved")
         beat_map = build_beat_map(
             transcript,
-            call_openai_llm,
+            call_beat_llm,
             analysis_map=analysis_map,
             cache_path=beat_map_json,
         )
@@ -338,7 +338,8 @@ def generate_shorts(
         highlights_result = get_highlights(
             transcript,
             num_clips=num_clips,
-            llm_fn=call_openai_llm,
+            llm_fn=call_beat_llm,
+            review_llm_fn=call_strong_llm,
             beat_map=beat_map,
             analysis_map=analysis_map,
             cache_path=highlights_json,
@@ -379,7 +380,7 @@ def generate_shorts(
             )
             write_json(top_json, {"highlights": verifier_candidates})
         stage("Checking clip boundaries", f"making sure {num_clips} clips end on complete thoughts")
-        top = verify_highlights_with_llm(transcript, verifier_candidates, num_clips, call_openai_llm)
+        top = verify_highlights_with_llm(transcript, verifier_candidates, num_clips, call_strong_llm)
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
         write_json(verified_top_json, {"highlights": top, "quality_limited": len(top) < num_clips})

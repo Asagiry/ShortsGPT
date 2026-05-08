@@ -27,6 +27,18 @@ def llm_model() -> str:
     )
 
 
+def llm_fast_model() -> str:
+    return os.getenv("LLM_FAST_MODEL", "").strip() or llm_model()
+
+
+def llm_beat_model() -> str:
+    return os.getenv("LLM_BEAT_MODEL", "").strip() or llm_fast_model()
+
+
+def llm_strong_model() -> str:
+    return os.getenv("LLM_STRONG_MODEL", "").strip() or llm_model()
+
+
 def local_whisper_model() -> str:
     return os.getenv("LOCAL_WHISPER_MODEL", "base").strip() or "base"
 

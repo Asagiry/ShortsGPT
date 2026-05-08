@@ -3,7 +3,7 @@ import json
 import urllib.error
 import urllib.request
 
-from ..config import llm_base_url, llm_model, require_openai_key
+from ..config import llm_base_url, llm_beat_model, llm_fast_model, llm_model, llm_strong_model, require_openai_key
 
 
 def _content_from_response(body: bytes, content_type: str) -> str:
@@ -33,13 +33,13 @@ def _content_from_response(body: bytes, content_type: str) -> str:
         raise RuntimeError(f"LLM response has unexpected format: {data}") from e
 
 
-def call_openai_llm(prompt: str) -> str:
+def _call_llm(prompt: str, model_name: str) -> str:
     api_key = require_openai_key()
     base_url = (llm_base_url() or "https://api.openai.com/v1").rstrip("/")
     url = f"{base_url}/chat/completions"
     payload = json.dumps(
         {
-            "model": llm_model(),
+            "model": model_name,
             "temperature": 0.45,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -68,3 +68,19 @@ def call_openai_llm(prompt: str) -> str:
     except json.JSONDecodeError as e:
         preview = body.decode("utf-8", errors="replace")[:1000]
         raise RuntimeError(f"LLM response is not valid JSON/SSE: {preview}") from e
+
+
+def call_openai_llm(prompt: str) -> str:
+    return _call_llm(prompt, llm_model())
+
+
+def call_fast_llm(prompt: str) -> str:
+    return _call_llm(prompt, llm_fast_model())
+
+
+def call_beat_llm(prompt: str) -> str:
+    return _call_llm(prompt, llm_beat_model())
+
+
+def call_strong_llm(prompt: str) -> str:
+    return _call_llm(prompt, llm_strong_model())

@@ -20,6 +20,9 @@ export default function App() {
   const [llmApiKey, setLlmApiKey] = useState('');
   const [llmBaseUrl, setLlmBaseUrl] = useState('');
   const [llmModel, setLlmModel] = useState('gpt-4o-mini');
+  const [llmFastModel, setLlmFastModel] = useState('');
+  const [llmBeatModel, setLlmBeatModel] = useState('');
+  const [llmStrongModel, setLlmStrongModel] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [phase, setPhase] = useState<AppPhase>('idle');
   const [statusText, setStatusText] = useState('Ready');
@@ -51,6 +54,9 @@ export default function App() {
       if (settings.llm_api_key) setLlmApiKey(settings.llm_api_key);
       if (settings.llm_base_url) setLlmBaseUrl(settings.llm_base_url);
       if (settings.llm_model) setLlmModel(settings.llm_model);
+      if (settings.llm_fast_model) setLlmFastModel(settings.llm_fast_model);
+      if (settings.llm_beat_model) setLlmBeatModel(settings.llm_beat_model);
+      if (settings.llm_strong_model) setLlmStrongModel(settings.llm_strong_model);
       setShowSettings(!settings.llm_api_key || !settings.llm_model);
       settingsLoadedRef.current = true;
     })();
@@ -84,14 +90,14 @@ export default function App() {
   const isRunning = phase === 'running';
   const selectedSources = sources.length ? sources : source.trim().split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const saveSettings = async () => {
-    await window.pywebview?.api?.save_settings?.({output_dir:outputDir,clips,quality,whisper,language,frame,edit_profile:editProfile,llm_api_key:llmApiKey,llm_base_url:llmBaseUrl,llm_model:llmModel});
+    await window.pywebview?.api?.save_settings?.({output_dir:outputDir,clips,quality,whisper,language,frame,edit_profile:editProfile,llm_api_key:llmApiKey,llm_base_url:llmBaseUrl,llm_model:llmModel,llm_fast_model:llmFastModel,llm_beat_model:llmBeatModel,llm_strong_model:llmStrongModel});
   };
 
   useEffect(() => {
     if (!settingsLoadedRef.current || isRunning) return;
     const timer = window.setTimeout(() => { saveSettings(); }, 500);
     return () => window.clearTimeout(timer);
-  }, [outputDir, clips, quality, whisper, language, frame, editProfile, llmApiKey, llmBaseUrl, llmModel, isRunning]);
+  }, [outputDir, clips, quality, whisper, language, frame, editProfile, llmApiKey, llmBaseUrl, llmModel, llmFastModel, llmBeatModel, llmStrongModel, isRunning]);
   const startJob = async () => {
     if (!selectedSources.length) return;
     await saveSettings();
@@ -108,6 +114,9 @@ export default function App() {
       llm_api_key: llmApiKey,
       llm_base_url: llmBaseUrl,
       llm_model: llmModel,
+      llm_fast_model: llmFastModel,
+      llm_beat_model: llmBeatModel,
+      llm_strong_model: llmStrongModel,
     });
     if (r && !r.ok) { setPhase('error'); setErrorMsg(r.error || 'Failed'); }
   };
@@ -131,6 +140,12 @@ export default function App() {
             <input className="field" placeholder="https://api.openai.com/v1 or compatible endpoint" value={llmBaseUrl} onChange={e => setLlmBaseUrl(e.target.value)} disabled={isRunning} />
             <label className="field-label">Model name</label>
             <input className="field" placeholder="gpt-4o-mini, gpt-4.1-mini, provider/model" value={llmModel} onChange={e => setLlmModel(e.target.value)} disabled={isRunning} />
+            <label className="field-label">Fast model</label>
+            <input className="field" placeholder="cheap model for profile/count checks" value={llmFastModel} onChange={e => setLlmFastModel(e.target.value)} disabled={isRunning} />
+            <label className="field-label">Beat model</label>
+            <input className="field" placeholder="cheap/mid model for story map and candidate batches" value={llmBeatModel} onChange={e => setLlmBeatModel(e.target.value)} disabled={isRunning} />
+            <label className="field-label">Strong model</label>
+            <input className="field" placeholder="best model for final picks and boundaries" value={llmStrongModel} onChange={e => setLlmStrongModel(e.target.value)} disabled={isRunning} />
             <button className="btn btn-primary btn-lg" onClick={async()=>{await saveSettings();setShowSettings(false);}}>Save settings</button>
           </div>
         </div>
