@@ -431,6 +431,7 @@ class Api:
                 generate_shorts = importlib.import_module(module_name).generate_shorts
                 base_output_dir = job_env["LOCAL_OUTPUT_DIR"]
                 Path(base_output_dir).mkdir(parents=True, exist_ok=True)
+                batch_errors = []
                 for index, source in enumerate(sources, 1):
                     if self._cancel:
                         raise RuntimeError("Stopped")
@@ -438,13 +439,32 @@ class Api:
                     Path(item_output_dir).mkdir(parents=True, exist_ok=True)
                     os.environ["LOCAL_OUTPUT_DIR"] = item_output_dir
                     print(f"[studio] batch {index}/{len(sources)} -> {item_output_dir}", flush=True)
-                    generate_shorts(
-                        video_url=source,
-                        num_clips=num_clips,
-                        download_format=str(settings.get("quality", "1080")),
-                        language=str(settings.get("language", "")) or None,
-                    )
-                self._emit("done", {"code": 0})
+                    try:
+                        generate_shorts(
+                            video_url=source,
+                            num_clips=num_clips,
+                            download_format=str(settings.get("quality", "1080")),
+                            language=str(settings.get("language", "")) or None,
+                        )
+                    except Exception as e:
+                        error_text = str(e)
+                        batch_errors.append({"index": index, "source": source, "output_dir": item_output_dir, "error": error_text})
+                        print(f"[studio] batch {index}/{len(sources)} failed: {error_text}", flush=True)
+                        try:
+                            error_path = Path(item_output_dir) / "batch_error.json"
+                            error_path.write_text(
+                                json.dumps(batch_errors[-1], ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                        except OSError:
+                            pass
+                        if self._cancel:
+                            raise RuntimeError("Stopped")
+                        continue
+                if batch_errors:
+                    self._emit("done", {"code": -1, "error": f"{len(batch_errors)} of {len(sources)} videos failed; completed the rest"})
+                else:
+                    self._emit("done", {"code": 0})
             except Exception as e:
                 original_stdout.write(f"[studio] FAILED: {e}\n")
                 self._emit("done", {"code": -1, "error": str(e)})
