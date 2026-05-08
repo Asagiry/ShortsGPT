@@ -37,7 +37,7 @@ Choose the maximum number of shorts that are worth generating naturally. Do NOT 
 Choose based on how many distinct, self-contained, viral-worthy ideas, stories, jokes, arguments, revelations, or emotional beats are actually present.
 
 Rules:
-- Count only moments that can stand alone as a 10-60 second short.
+- Count only moments that can stand alone as a short. Aim for 10-60 seconds, but allow 61-75 seconds only when needed to keep the final phrase/reaction complete.
 - Multiple clips are good only when they cover different meanings or beats.
 - Do not force filler clips just to make more output.
 - It is better to output 2 great clips than 12 average clips.
@@ -124,7 +124,7 @@ What makes a good clip:
 Duration guidance:
 - Prefer 18-45 seconds when that preserves the full idea.
 - 10-17 seconds is fine for a very complete punchline or one-liner.
-- Maximum 60 seconds. If a beat needs more than 60 seconds, choose a tighter complete sub-beat or skip it.
+- Aim for 60 seconds or less. If the complete ending lands slightly later, 61-75 seconds is acceptable. If a beat needs more than 75 seconds, choose a tighter complete sub-beat or skip it.
 - Do not cut the ending just to make the clip shorter. Completeness beats aggressive trimming.
 
 Good signals:
@@ -158,7 +158,7 @@ Timestamp rules:
 - Do not end before the speaker finishes the selected idea.
 - Prefer ending at the end of a transcript segment or after a clear pause. Never place end_time in the middle of an ongoing phrase.
 - Do not add unrelated context before or after the selected beat.
-- Clip duration must be 10-60 seconds. If the complete idea would exceed 60 seconds, select a smaller complete sub-beat instead of truncating it.
+- Clip duration should usually be 10-60 seconds. Use 61-75 seconds only to preserve a complete final sentence, answer, punchline, or reaction. If the complete idea would exceed 75 seconds, select a smaller complete sub-beat instead of truncating it.
 
 MANDATORY RULES:
 1. COMPLETE MEANING - never cut off the ending of the selected idea.
@@ -187,13 +187,13 @@ Rules:
 - Return fewer clips than requested when the batch is weak. Returning zero is correct for a weak batch.
 - Do not include average/filler moments just to increase output count.
 - Preserve setup -> development -> payoff/reaction.
-- If a beat is longer than 60 seconds, choose a smaller complete sub-beat inside it.
+- If a beat is longer than 75 seconds, choose a smaller complete sub-beat inside it.
 - Never end in the middle of a sentence, answer, joke, reaction, or boundary_note.
 - Never shorten a clip by cutting off the last reaction, rebuttal, object reveal, or visual landing.
 - Prefer boundaries aligned to utterance_start_id/utterance_end_id and nearby scene cuts.
 - Favor candidates with strong local_score/audio_peak_ratio unless visual_dependency is high and the transcript alone is insufficient.
 - For cartoons/comedy/dialogue, do not cut before the reaction or landing if it is part of the joke.
-- Clip duration must be 10-60 seconds.
+- Clip duration should usually be 10-60 seconds; 61-75 seconds is allowed only to avoid cutting the ending.
 - {num_clips_instruction}
 
 Respond ONLY with valid JSON:
@@ -216,7 +216,7 @@ Rules:
 - Do not choose overlapping clips.
 - Do not choose clips ending mid-sentence or before the reaction/landing.
 - If preserving the final reaction requires trimming, move start_time later rather than cutting end_time earlier.
-- Keep 10-60 seconds.
+- Keep clips around 10-60 seconds; 61-75 seconds is allowed only when needed for a complete ending.
 - You may adjust start_time/end_time slightly to clean boundaries.
 
 Respond JSON only:
@@ -838,7 +838,11 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
-def keep_postable_highlights(highlights: List[Dict], min_score: int = MIN_POSTABLE_SCORE) -> List[Dict]:
+def keep_postable_highlights(
+    highlights: List[Dict],
+    min_score: int = MIN_POSTABLE_SCORE,
+    max_duration: float = 75.5,
+) -> List[Dict]:
     kept = []
     for h in highlights:
         try:
@@ -850,7 +854,7 @@ def keep_postable_highlights(highlights: List[Dict], min_score: int = MIN_POSTAB
         duration = end - start
         if score < min_score:
             continue
-        if duration < 10.0 or duration > 60.5:
+        if duration < 10.0 or duration > max_duration:
             continue
         kept.append(h)
     return kept
@@ -897,8 +901,8 @@ Rules:
 - COMPLETE ENDING: keep the payoff, answer, reaction, or final sentence. Do not cut mid-thought.
 - VISUAL LANDING: for scripted scenes/cartoons, keep the silent reaction or visual gag landing after the last spoken line when it completes the moment.
 - CLEAN START: start where the viewer has enough context and the hook begins.
-- DURATION: 10-60s. Prefer 18-45s if that keeps the full idea intact.
-- If a candidate cannot fit under 60 seconds without cutting the ending, move start_time later to a smaller complete sub-beat or reject it.
+- DURATION: usually 10-60s, preferably 18-45s if that keeps the full idea intact. 61-75s is acceptable only to preserve the final sentence/reaction.
+- If a candidate cannot fit under 75 seconds without cutting the ending, move start_time later to a smaller complete sub-beat or reject it.
 - Put end_time on a phrase/segment boundary, not in the middle of spoken text.
 - ONE IDEA PER CLIP: each selected clip should cover one coherent beat.
 - REJECT: boring filler, repeated ideas, unclear context, clips that need missing setup, clips that end before the idea lands, or clips without a strong turn/payoff/reaction.

@@ -64,7 +64,8 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
     return candidate_end + 0.45
 
 
-MAX_CLIP_SECONDS = 60  # hard cap — no clip exceeds 60s
+TARGET_CLIP_SECONDS = 60.0
+MAX_CLIP_SECONDS = 75.0
 
 
 def _has_natural_pause_after(segments: List[Dict], index: int, duration: float) -> bool:
@@ -78,12 +79,77 @@ def _ends_like_sentence(text: str) -> bool:
     return (text or "").strip().endswith((".", "!", "?", "...", "…", "вЂ¦"))
 
 
-def _natural_end_before_cap(start: float, end: float, transcript: Dict) -> float:
+def _clip_limit_seconds() -> float:
+    try:
+        configured = float(os.getenv("LOCAL_MAX_CLIP_SECONDS", str(MAX_CLIP_SECONDS)))
+    except ValueError:
+        configured = MAX_CLIP_SECONDS
+    return max(TARGET_CLIP_SECONDS, min(configured, 180.0))
+
+
+def _word_boundary_end(segments: List[Dict], start: float, end: float, max_end: float, duration: float) -> float:
+    """Move an end timestamp out of the middle of a word when word timestamps exist."""
+    best_end = end
+    for segment in segments:
+        if float(segment.get("end", 0.0)) < start or float(segment.get("start", 0.0)) > max_end:
+            continue
+        for word in segment.get("words", []) or []:
+            try:
+                word_start = float(word.get("start", 0.0))
+                word_end = float(word.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if word_start < end < word_end + 0.05:
+                candidate = word_end + 0.12
+                if candidate <= max_end:
+                    best_end = max(best_end, candidate)
+            elif 0.0 <= word_start - end <= 0.25 and word_end <= max_end:
+                best_end = max(best_end, word_end + 0.12)
+            if best_end > end:
+                break
+        if best_end > end:
+            break
+    if duration > 0:
+        best_end = min(best_end, duration)
+    return best_end
+
+
+def _shift_start_to_fit(start: float, end: float, segments: List[Dict], limit: float) -> Optional[float]:
+    if end - start <= limit:
+        return start
+    earliest_allowed = end - limit
+    candidates = [
+        max(0.0, float(segment["start"]) - 0.2)
+        for segment in segments
+        if float(segment["start"]) >= earliest_allowed and end - float(segment["start"]) >= 10.0
+    ]
+    return candidates[0] if candidates else None
+
+
+def _extend_to_min_duration_clean(start: float, end: float, segments: List[Dict], duration: float, max_end: float) -> float:
+    if end - start >= 10.0:
+        return end
+    for index, segment in enumerate(segments):
+        seg_end = float(segment["end"])
+        if seg_end <= end:
+            continue
+        if seg_end > max_end:
+            break
+        end = seg_end + 0.25
+        if end - start >= 10.0 and (
+            _ends_like_sentence(segment.get("text", "")) or _has_natural_pause_after(segments, index, duration)
+        ):
+            break
+    return min(end, duration) if duration > 0 else end
+
+
+def _natural_end_before_cap(start: float, end: float, transcript: Dict) -> Optional[float]:
     segments = transcript.get("segments", [])
-    if end - start <= MAX_CLIP_SECONDS or not segments:
+    limit = _clip_limit_seconds()
+    if end - start <= limit or not segments:
         return end
 
-    max_end = start + MAX_CLIP_SECONDS
+    max_end = start + limit
     duration = float(transcript.get("duration", 0.0) or 0.0)
     eligible = [
         (index, segment)
@@ -91,7 +157,7 @@ def _natural_end_before_cap(start: float, end: float, transcript: Dict) -> float
         if float(segment["end"]) <= max_end and float(segment["end"]) > start + 10.0
     ]
     if not eligible:
-        return max_end
+        return None
 
     natural = [
         float(segment["end"])
@@ -109,12 +175,13 @@ def _complete_clip_boundaries(highlights: List[Dict], transcript: Dict) -> List[
     if not segments:
         return highlights
 
+    limit = _clip_limit_seconds()
     duration = float(transcript.get("duration", 0.0) or 0.0)
     fixed = []
     for highlight in highlights:
         start = max(0.0, float(highlight.get("start_time", 0.0)))
         end = float(highlight.get("end_time", 0.0))
-        max_end = start + MAX_CLIP_SECONDS
+        max_end = start + limit
 
         containing = _segment_index_at(segments, end)
         if containing is not None:
@@ -122,14 +189,12 @@ def _complete_clip_boundaries(highlights: List[Dict], transcript: Dict) -> List[
             if seg_end <= max_end:
                 end = seg_end + 0.25
             else:
-                previous = [
-                    s for s in segments
-                    if float(s["end"]) <= max_end and float(s["end"]) > start + 10.0
-                ]
-                if previous:
-                    end = float(previous[-1]["end"]) + 0.25
-                else:
-                    end = max_end
+                shifted_start = _shift_start_to_fit(start, seg_end + 0.25, segments, limit)
+                if shifted_start is None:
+                    continue
+                start = shifted_start
+                end = seg_end + 0.25
+                max_end = start + limit
 
         end_index = None
         for index, segment in enumerate(segments):
@@ -148,11 +213,19 @@ def _complete_clip_boundaries(highlights: List[Dict], transcript: Dict) -> List[
                 if _ends_like_sentence(segment.get("text", "")) or _has_natural_pause_after(segments, index, duration):
                     break
 
+        end = _word_boundary_end(segments, start, end, max_end, duration)
         if duration > 0:
             end = min(end, duration)
-        end = min(end, max_end)
+        if end - start > limit:
+            shifted_start = _shift_start_to_fit(start, end, segments, limit)
+            if shifted_start is None:
+                continue
+            start = shifted_start
+            max_end = start + limit
         if end - start < 10.0:
-            end = min(max_end, start + 10.0, duration or start + 10.0)
+            end = _extend_to_min_duration_clean(start, end, segments, duration, max_end)
+        if end - start < 10.0 or end - start > limit + 0.25:
+            continue
         fixed.append({**highlight, "start_time": start, "end_time": end})
     return fixed
 
@@ -173,14 +246,18 @@ def _snap_beat_boundaries_to_utterances(beat_map: Dict, analysis_map: Dict) -> D
 
 
 def _enforce_duration_cap(highlights: List[Dict], transcript: Dict) -> List[Dict]:
-    """Hard-cap every clip to MAX_CLIP_SECONDS, trimming the end."""
+    """Keep clips within the render limit without cutting off their endings."""
     capped = []
+    segments = transcript.get("segments", [])
+    limit = _clip_limit_seconds()
     for h in highlights:
         start = float(h.get("start_time", 0))
         end = float(h.get("end_time", 0))
-        if end - start > MAX_CLIP_SECONDS:
-            end = _natural_end_before_cap(start, end, transcript)
-            h = {**h, "end_time": end}
+        if end - start > limit:
+            shifted_start = _shift_start_to_fit(start, end, segments, limit) if segments else None
+            if shifted_start is None:
+                continue
+            h = {**h, "start_time": shifted_start}
         capped.append(h)
     return _complete_clip_boundaries(capped, transcript)
 
