@@ -82,7 +82,8 @@ export default function App() {
       setProgress(v => Math.max(v, 37)); setStatusText('Analyzing media'); setActiveStep(2);
     } else if (line.includes('[transcribe]') && line.includes('%')) {
       try { const p = parseFloat(line.split('%')[0].split(/\s+/).pop() || '0'); setProgress(v => Math.max(v, Math.min(35, p * 0.35))); setStatusText(`Transcribing ${p.toFixed(1)}%`); setActiveStep(1); } catch {}
-    } else if (line.includes('Choosing edit style') || line.includes('Edit style selected')) { setProgress(v => Math.max(v, 38)); setStatusText('Choosing edit style'); setActiveStep(2); }
+    } else if (line.includes('Understanding episode') || line.includes('Episode brief')) { setProgress(v => Math.max(v, 38)); setStatusText('Understanding episode'); setActiveStep(2); }
+    else if (line.includes('Choosing edit style') || line.includes('Edit style selected')) { setProgress(v => Math.max(v, 39)); setStatusText('Choosing edit style'); setActiveStep(2); }
     else if (line.includes('Planning clip count') || line.includes('Clip count')) { setProgress(v => Math.max(v, 40)); setStatusText('Planning clip count'); setActiveStep(2); }
     else if (line.includes('GPT story mapping') || line.includes('GPT story map') || line.includes('Story beats')) { setProgress(v => Math.max(v, 44)); setStatusText('Mapping story beats'); setActiveStep(3); }
     else if (line.includes('[LLM story beats]') && line.includes('%')) {

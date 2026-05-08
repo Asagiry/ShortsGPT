@@ -79,6 +79,28 @@ Respond JSON only:
 {"profile":"...","tighten_pauses":true,"pause_threshold":1.2,"pause_keep":0.5,"reason":"..."}"""
 
 
+EPISODE_DIGEST_PROMPT = """You are preparing an editorial brief for clipping a scripted episode into short-form videos.
+
+Analyze the transcript like a story editor, not like a keyword extractor.
+
+Return:
+- logline: one sentence summary of the episode
+- main_conflict: the central story/problem
+- characters: important characters and what they want
+- recurring_jokes: repeated jokes/running bits if present
+- story_turns: major plot turns in order
+- clip_strategy: what kind of moments should be clipped for this episode
+- avoid: what would make bad shorts for this episode
+
+Rules:
+- Keep it compact and practical for another LLM choosing clips.
+- Do not invent facts not present in transcript.
+- For cartoons/sitcoms, emphasize setup -> reversal -> punchline/reaction.
+
+Respond JSON only:
+{"logline":"...","main_conflict":"...","characters":[{"name":"...","role":"...","wants":"..."}],"recurring_jokes":["..."],"story_turns":["..."],"clip_strategy":["..."],"avoid":["..."]}"""
+
+
 BEAT_MAP_PROMPT = """You are making an editorial beat map from a timestamped transcript and local media analysis.
 
 Do not select final clips yet. First divide the transcript into complete meaning units.
@@ -171,9 +193,10 @@ MANDATORY RULES:
 6. SCORE 0-100 - score for retention, clarity, emotional pull, and completeness.
 7. {num_clips_instruction}
 8. For each highlight, explain why this clip works as a short ("virality_reason").
+9. Include score_matrix: hook, standalone_clarity, setup_completeness, payoff_strength, ending_completeness, shareability, context_loss_risk.
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","score_matrix":{{"hook":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"shareability":0,"context_loss_risk":0}}}}]}}"""
 
 
 BEAT_HIGHLIGHT_PROMPT = """You are a senior short-form editor selecting final shorts from an editorial beat map.
@@ -181,6 +204,9 @@ BEAT_HIGHLIGHT_PROMPT = """You are a senior short-form editor selecting final sh
 {virality_criteria}
 
 Content type: {content_type} | Density: {density}
+
+Episode editorial brief:
+{episode_context}
 
 Choose the best complete clips from the beats below.
 
@@ -198,10 +224,11 @@ Rules:
 - Favor candidates with strong local_score/audio_peak_ratio unless visual_dependency is high and the transcript alone is insufficient.
 - For cartoons/comedy/dialogue, do not cut before the reaction or landing if it is part of the joke.
 - Clip duration should usually be 10-60 seconds; 61-75 seconds is allowed only to avoid cutting the ending.
+- Include score_matrix: hook, standalone_clarity, setup_completeness, payoff_strength, ending_completeness, shareability, context_loss_risk.
 - {num_clips_instruction}
 
 Respond ONLY with valid JSON:
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","score_matrix":{{"hook":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"shareability":0,"context_loss_risk":0}}}}]}}
 
 Beat map:
 {beat_map_json}"""
@@ -298,6 +325,10 @@ def _analysis_for_window(analysis_map: Optional[Dict], start: float, end: float)
         c for c in analysis_map.get("scene_cuts", [])
         if start <= float(c.get("time", 0.0)) <= end
     ]
+    scene_windows = [
+        s for s in analysis_map.get("scene_windows", [])
+        if float(s.get("end", 0.0)) >= start and float(s.get("start", 0.0)) <= end
+    ]
     audio = [
         w for w in analysis_map.get("audio_energy", [])
         if w.get("peak") and float(w.get("end", 0.0)) >= start and float(w.get("start", 0.0)) <= end
@@ -308,6 +339,7 @@ def _analysis_for_window(analysis_map: Optional[Dict], start: float, end: float)
             for u in utterances[:80]
         ],
         "scene_cuts": scene_cuts[:80],
+        "scene_windows": scene_windows[:40],
         "audio_peak_windows": audio[:60],
     }
 
@@ -317,6 +349,12 @@ def _compact_text(value: str, limit: int = 260) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 1].rstrip() + "…"
+
+
+def _episode_context_text(episode_digest: Optional[Dict]) -> str:
+    if not episode_digest:
+        return "No episode brief available."
+    return json.dumps(episode_digest, ensure_ascii=False, separators=(",", ":"))[:5000]
 
 
 def _dedupe_beats(beats: List[Dict]) -> List[Dict]:
@@ -449,11 +487,50 @@ def decide_edit_plan(
     return base
 
 
+def build_episode_digest(
+    transcript: Dict,
+    llm_fn: LLMFn,
+    analysis_map: Optional[Dict] = None,
+    cache_path: Optional[str] = None,
+) -> Dict:
+    cached = read_json(cache_path) if cache_path else None
+    if cached and cached.get("complete"):
+        return cached
+
+    sample = build_transcript_sample(transcript, max_chars=18000)
+    analysis_json = json.dumps(
+        _compact_analysis_for_prompt(analysis_map),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )[:7000]
+    prompt = (
+        f"{EPISODE_DIGEST_PROMPT}\n\n"
+        f"Local media analysis summary:\n{analysis_json}\n\n"
+        f"Timestamped transcript sample:\n{sample}"
+    )
+    user_log("Episode brief", "understanding story, characters, and clip strategy")
+    data = _parse_json_loose(llm_fn(prompt))
+    digest = {
+        "complete": True,
+        "logline": str(data.get("logline", "")),
+        "main_conflict": str(data.get("main_conflict", "")),
+        "characters": data.get("characters", []) if isinstance(data.get("characters", []), list) else [],
+        "recurring_jokes": data.get("recurring_jokes", []) if isinstance(data.get("recurring_jokes", []), list) else [],
+        "story_turns": data.get("story_turns", []) if isinstance(data.get("story_turns", []), list) else [],
+        "clip_strategy": data.get("clip_strategy", []) if isinstance(data.get("clip_strategy", []), list) else [],
+        "avoid": data.get("avoid", []) if isinstance(data.get("avoid", []), list) else [],
+    }
+    if cache_path:
+        write_json(cache_path, digest)
+    return digest
+
+
 def _compact_analysis_for_prompt(analysis_map: Optional[Dict]) -> Dict:
     if not analysis_map:
         return {}
     utterances = analysis_map.get("utterances", [])
     scene_cuts = analysis_map.get("scene_cuts", [])
+    scene_windows = analysis_map.get("scene_windows", [])
     audio = analysis_map.get("audio_energy", [])
     peak_windows = [w for w in audio if w.get("peak")]
     return {
@@ -462,6 +539,7 @@ def _compact_analysis_for_prompt(analysis_map: Optional[Dict]) -> Dict:
             for u in utterances[:180]
         ],
         "scene_cuts": scene_cuts[:180],
+        "scene_windows": scene_windows[:80],
         "audio_peak_windows": peak_windows[:140],
     }
 
@@ -535,6 +613,7 @@ def build_beat_map(
     transcript: Dict,
     llm_fn: LLMFn,
     analysis_map: Optional[Dict] = None,
+    episode_digest: Optional[Dict] = None,
     cache_path: Optional[str] = None,
 ) -> Dict:
     duration = float(transcript.get("duration", 0.0) or 0.0)
@@ -578,6 +657,7 @@ def build_beat_map(
         )[:9000]
         prompt = (
             f"{BEAT_MAP_PROMPT}\n\n"
+            f"Episode editorial brief:\n{_episode_context_text(episode_digest)}\n\n"
             f"Video window: {start:.0f}s-{end:.0f}s of {duration:.0f}s\n\n"
             f"Local media analysis for this window:\n{analysis_json}\n\n"
             f"Timestamped transcript window:\n{text[:18000]}"
@@ -693,6 +773,7 @@ def call_highlight_api_from_beats(
     llm_fn: LLMFn = None,
     review_llm_fn: Optional[LLMFn] = None,
     analysis_map: Optional[Dict] = None,
+    episode_digest: Optional[Dict] = None,
     cache_path: Optional[str] = None,
 ) -> Dict:
     beats = beat_map.get("beats", [])
@@ -730,6 +811,7 @@ def call_highlight_api_from_beats(
             virality_criteria=VIRALITY_CRITERIA,
             content_type=content_info.get("content_type", "other"),
             density=content_info.get("density", "medium"),
+            episode_context=_episode_context_text(episode_digest),
             num_clips_instruction="Generate 0-3 highlights from this batch. Return zero if there are no bangers.",
             beat_map_json=batch_json,
         )
@@ -858,6 +940,15 @@ def keep_postable_highlights(
         duration = end - start
         if score < min_score:
             continue
+        matrix = h.get("score_matrix") if isinstance(h.get("score_matrix"), dict) else {}
+        try:
+            ending = int(matrix.get("ending_completeness", 100))
+            context_risk = int(matrix.get("context_loss_risk", 0))
+        except (TypeError, ValueError):
+            ending = 100
+            context_risk = 0
+        if ending < 78 or context_risk > 72:
+            continue
         if duration < 10.0 or duration > max_duration:
             continue
         kept.append(h)
@@ -868,6 +959,7 @@ def refine_highlight_boundaries_with_llm(
     transcript: Dict,
     highlights: List[Dict],
     llm_fn: LLMFn,
+    episode_digest: Optional[Dict] = None,
 ) -> List[Dict]:
     if not highlights:
         return []
@@ -905,6 +997,9 @@ def refine_highlight_boundaries_with_llm(
 The clips are already selected. Do NOT replace them with different scenes.
 Your only job is to adjust start_time/end_time so each clip is a complete mini-scene.
 
+Episode editorial brief:
+{_episode_context_text(episode_digest)}
+
 Rules:
 - Keep the selected idea, but include the necessary setup, turn, payoff, final answer, reaction, or visual/silent landing.
 - Do not end just because speech pauses; end when the meaning of the scene beat has landed.
@@ -913,9 +1008,10 @@ Rules:
 - Aim for 18-60 seconds. Use up to 75 seconds when needed for a complete ending.
 - If a candidate cannot be made complete from the given context, set keep=false.
 - Put boundaries on transcript segment boundaries when possible.
+- Prefer text anchors over raw timestamps: choose exact transcript words where the clip begins and ends.
 
 Respond JSON only:
-{{"clips":[{{"id":int,"keep":true,"start_time":float,"end_time":float,"reason":"short boundary reason"}}]}}
+{{"clips":[{{"id":int,"keep":true,"start_time":float,"end_time":float,"start_anchor_text":"exact transcript words","end_anchor_text":"exact transcript words","include_after_end_seconds":0.0,"score_matrix":{{"hook":0,"standalone_clarity":0,"setup_completeness":0,"payoff_strength":0,"ending_completeness":0,"context_loss_risk":0}},"reason":"short boundary reason"}}]}}
 
 Candidates:
 {json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:24000]}
@@ -941,6 +1037,16 @@ Candidates:
             continue
         h["start_time"] = start
         h["end_time"] = end
+        if item.get("start_anchor_text"):
+            h["start_anchor_text"] = str(item.get("start_anchor_text"))
+        if item.get("end_anchor_text"):
+            h["end_anchor_text"] = str(item.get("end_anchor_text"))
+        try:
+            h["include_after_end_seconds"] = max(0.0, min(float(item.get("include_after_end_seconds", 0.0) or 0.0), 3.0))
+        except (TypeError, ValueError):
+            pass
+        if isinstance(item.get("score_matrix"), dict):
+            h["score_matrix"] = item["score_matrix"]
         if item.get("reason"):
             h["boundary_reason"] = str(item.get("reason"))
         refined.append(h)
@@ -1030,6 +1136,7 @@ def get_highlights(
     review_llm_fn: Optional[LLMFn] = None,
     beat_map: Optional[Dict] = None,
     analysis_map: Optional[Dict] = None,
+    episode_digest: Optional[Dict] = None,
     cache_path: Optional[str] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
@@ -1054,6 +1161,7 @@ def get_highlights(
             llm_fn=llm_fn,
             review_llm_fn=review_llm_fn,
             analysis_map=analysis_map,
+            episode_digest=episode_digest,
             cache_path=cache_path,
         )
         highlights = dedupe_highlights(result.get("highlights", []))

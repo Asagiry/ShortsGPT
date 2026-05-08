@@ -4,11 +4,12 @@ Pipeline: yt-dlp download -> faster-whisper transcribe -> OpenAI LLM highlights 
 All processing runs locally. OPENAI_API_KEY required for highlight analysis.
 """
 import os
+import re
 import shutil
 from typing import Dict, List, Optional
 
 from .config import edit_profile, local_output_dir
-from .highlights import build_beat_map, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights, refine_highlight_boundaries_with_llm
+from .highlights import build_beat_map, build_episode_digest, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights, refine_highlight_boundaries_with_llm
 
 
 def _snap_highlights_to_segments(highlights: List[Dict], transcript: Dict) -> List[Dict]:
@@ -67,6 +68,100 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
 TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
 BOUNDARY_REVIEW_VERSION = 2
+EPISODE_DIGEST_VERSION = 1
+
+
+def _norm_words(text: str) -> List[str]:
+    return re.findall(r"[\wЁёА-Яа-я]+", (text or "").casefold())
+
+
+def _transcript_words(transcript: Dict) -> List[Dict]:
+    out = []
+    for segment in transcript.get("segments", []):
+        words = segment.get("words") or []
+        if words:
+            for word in words:
+                text = str(word.get("text", "")).strip()
+                norm = _norm_words(text)
+                if not norm:
+                    continue
+                out.append({
+                    "text": text,
+                    "norm": norm[0],
+                    "start": float(word.get("start", segment.get("start", 0.0))),
+                    "end": float(word.get("end", segment.get("end", 0.0))),
+                })
+        else:
+            text_words = _norm_words(str(segment.get("text", "")))
+            if not text_words:
+                continue
+            seg_start = float(segment.get("start", 0.0))
+            seg_end = float(segment.get("end", seg_start))
+            span = max(0.1, seg_end - seg_start)
+            for index, word in enumerate(text_words):
+                out.append({
+                    "text": word,
+                    "norm": word,
+                    "start": seg_start + span * index / max(1, len(text_words)),
+                    "end": seg_start + span * (index + 1) / max(1, len(text_words)),
+                })
+    return out
+
+
+def _find_anchor_time(words: List[Dict], anchor: str, start_hint: float, end_hint: float, prefer_end: bool) -> Optional[float]:
+    query = _norm_words(anchor)
+    if not query:
+        return None
+    window_start = max(0.0, start_hint - 45.0)
+    window_end = end_hint + 45.0
+    best = None
+    best_score = -1.0
+    q_len = len(query)
+    for i in range(0, max(0, len(words) - q_len + 1)):
+        if words[i]["start"] < window_start or words[i]["end"] > window_end:
+            continue
+        slice_words = [w["norm"] for w in words[i:i + q_len]]
+        exact = slice_words == query
+        if exact:
+            score = 1000.0 - abs((words[i + q_len - 1]["end"] if prefer_end else words[i]["start"]) - (end_hint if prefer_end else start_hint))
+        else:
+            overlap = sum(1 for a, b in zip(slice_words, query) if a == b)
+            score = overlap / max(q_len, 1)
+            if score < 0.72:
+                continue
+            score -= abs((words[i + q_len - 1]["end"] if prefer_end else words[i]["start"]) - (end_hint if prefer_end else start_hint)) / 200.0
+        if score > best_score:
+            best_score = score
+            best = words[i + q_len - 1]["end"] if prefer_end else words[i]["start"]
+    return best
+
+
+def _apply_text_anchor_boundaries(highlights: List[Dict], transcript: Dict) -> List[Dict]:
+    words = _transcript_words(transcript)
+    if not words:
+        return highlights
+    duration = float(transcript.get("duration", 0.0) or 0.0)
+    fixed = []
+    for h in highlights:
+        start = float(h.get("start_time", 0.0))
+        end = float(h.get("end_time", 0.0))
+        start_anchor = str(h.get("start_anchor_text", "")).strip()
+        end_anchor = str(h.get("end_anchor_text", "")).strip()
+        mapped_start = _find_anchor_time(words, start_anchor, start, end, prefer_end=False) if start_anchor else None
+        mapped_end = _find_anchor_time(words, end_anchor, start, end, prefer_end=True) if end_anchor else None
+        if mapped_start is not None:
+            start = max(0.0, mapped_start - 0.15)
+        if mapped_end is not None:
+            try:
+                tail = max(0.0, min(float(h.get("include_after_end_seconds", 0.0) or 0.0), 3.0))
+            except (TypeError, ValueError):
+                tail = 0.0
+            end = mapped_end + 0.25 + tail
+        if duration > 0:
+            end = min(end, duration)
+        if end > start:
+            fixed.append({**h, "start_time": start, "end_time": end})
+    return fixed
 
 
 def _has_natural_pause_after(segments: List[Dict], index: int, duration: float) -> bool:
@@ -325,6 +420,7 @@ def generate_shorts(
     source_json = f"{session_path}/source.json"
     transcript_json = f"{session_path}/transcript.json"
     analysis_map_json = f"{session_path}/analysis_map.json"
+    episode_digest_json = f"{session_path}/episode_digest.json"
     beat_map_json = f"{session_path}/beat_map.json"
     highlights_json = f"{session_path}/highlights.json"
     auto_plan_json = f"{session_path}/auto_plan.json"
@@ -364,7 +460,7 @@ def generate_shorts(
         )
 
     analysis_map = read_json(analysis_map_json)
-    if analysis_map and analysis_map.get("utterances"):
+    if analysis_map and analysis_map.get("utterances") and analysis_map.get("scene_windows"):
         user_log(
             "Media analysis ready",
             f"{len(analysis_map.get('utterances', []))} dialogue blocks, "
@@ -373,6 +469,21 @@ def generate_shorts(
     else:
         analysis_map = build_analysis_map(source_path, transcript)
         write_json(analysis_map_json, analysis_map)
+
+    episode_digest = read_json(episode_digest_json)
+    if episode_digest and episode_digest.get("complete") and episode_digest.get("version") == EPISODE_DIGEST_VERSION:
+        user_log("Episode brief ready", str(episode_digest.get("logline", "loaded from cache")))
+    else:
+        stage("Understanding episode", "building story brief for smarter clip selection")
+        episode_digest = build_episode_digest(
+            transcript,
+            call_fast_llm,
+            analysis_map=analysis_map,
+            cache_path=episode_digest_json,
+        )
+        episode_digest["version"] = EPISODE_DIGEST_VERSION
+        write_json(episode_digest_json, episode_digest)
+        user_log("Episode brief ready", str(episode_digest.get("logline", "")))
 
     requested_edit_profile = edit_profile()
     stage("Choosing edit style", f"profile setting: {requested_edit_profile}")
@@ -423,6 +534,7 @@ def generate_shorts(
             transcript,
             call_beat_llm,
             analysis_map=analysis_map,
+            episode_digest=episode_digest,
             cache_path=beat_map_json,
         )
         beat_map = _snap_beat_boundaries_to_utterances(beat_map, analysis_map)
@@ -445,6 +557,7 @@ def generate_shorts(
             review_llm_fn=call_fast_llm,
             beat_map=beat_map,
             analysis_map=analysis_map,
+            episode_digest=episode_digest,
             cache_path=highlights_json,
         )
         highlights_result["highlights"] = keep_postable_highlights(
@@ -483,7 +596,8 @@ def generate_shorts(
             )[:num_clips]
             write_json(top_json, {"highlights": top})
         stage("Checking clip boundaries", f"LLM adjusts {len(top)} clips to semantic scene endings")
-        top = refine_highlight_boundaries_with_llm(transcript, top, call_fast_llm)
+        top = refine_highlight_boundaries_with_llm(transcript, top, call_fast_llm, episode_digest=episode_digest)
+        top = _apply_text_anchor_boundaries(top, transcript)
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
         write_json(verified_top_json, {

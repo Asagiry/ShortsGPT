@@ -182,6 +182,43 @@ def _range_score(start: float, end: float, utterances: List[Dict], audio_windows
     }
 
 
+def _scene_windows(duration: float, utterances: List[Dict], scene_cuts: List[Dict], audio_windows: List[Dict]) -> List[Dict]:
+    boundaries = {0.0, round(duration, 2)}
+    for cut in scene_cuts:
+        t = round(float(cut.get("time", 0.0)), 2)
+        if 0.0 <= t <= duration:
+            boundaries.add(t)
+    for left, right in zip(utterances, utterances[1:]):
+        gap = float(right["start"]) - float(left["end"])
+        if gap >= 2.2:
+            boundaries.add(round((float(left["end"]) + float(right["start"])) / 2.0, 2))
+    ordered = sorted(boundaries)
+    scenes = []
+    for index, (start, end) in enumerate(zip(ordered, ordered[1:]), 1):
+        if end - start < 4.0:
+            continue
+        text_items = [
+            str(u.get("text", "")).strip()
+            for u in utterances
+            if float(u.get("end", 0.0)) >= start and float(u.get("start", 0.0)) <= end
+        ]
+        if not text_items:
+            continue
+        audio = [w for w in audio_windows if float(w["end"]) >= start and float(w["start"]) <= end]
+        peak_ratio = sum(1 for w in audio if w.get("peak")) / max(1, len(audio))
+        text = " ".join(text_items)
+        scenes.append({
+            "id": f"s{index:04d}",
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "duration": round(end - start, 2),
+            "summary_text": text[:420],
+            "utterance_count": len(text_items),
+            "audio_peak_ratio": round(peak_ratio, 2),
+        })
+    return scenes
+
+
 def build_analysis_map(source_path: str, transcript: Dict) -> Dict:
     duration = float(transcript.get("duration", 0.0) or 0.0)
     stage("Analyzing video and audio", "detecting scenes, speech blocks, and loud moments")
@@ -192,11 +229,14 @@ def build_analysis_map(source_path: str, transcript: Dict) -> Dict:
     audio = _audio_energy(source_path)
     peak_count = sum(1 for item in audio if item.get("peak"))
     user_log("Audio energy", f"{len(audio)} seconds analyzed, {peak_count} high-energy seconds")
+    scene_windows = _scene_windows(duration, utterances, scenes, audio)
+    user_log("Scene map", f"{len(scene_windows)} dialogue scenes estimated")
     return {
         "source": "local",
         "duration": duration,
         "utterances": utterances,
         "scene_cuts": scenes,
+        "scene_windows": scene_windows,
         "audio_energy": audio,
     }
 

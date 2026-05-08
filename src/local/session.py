@@ -86,6 +86,7 @@ def hydrate_from_matching_source(current_session_path: str, source_path: str) ->
             "transcript.json",
             "auto_plan.json",
             "analysis_map.json",
+            "episode_digest.json",
             "beat_map.json",
             "edit_plan.json",
             "highlights.json",
