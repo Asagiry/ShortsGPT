@@ -47,7 +47,23 @@ def _same_source(left: str, right: str) -> bool:
     right_abs = os.path.abspath(right)
     if left_abs == right_abs:
         return True
-    return os.path.basename(left_abs).lower() == os.path.basename(right_abs).lower()
+    if os.path.basename(left_abs).lower() == os.path.basename(right_abs).lower():
+        return True
+    try:
+        left_stat = os.stat(left_abs)
+        right_stat = os.stat(right_abs)
+    except OSError:
+        return False
+    if left_stat.st_size != right_stat.st_size:
+        return False
+    same_folder = os.path.abspath(os.path.dirname(left_abs)) == os.path.abspath(os.path.dirname(right_abs))
+    close_mtime = abs(left_stat.st_mtime - right_stat.st_mtime) <= 2.0
+    return same_folder and close_mtime
+
+
+def _valid_transcript(path: str) -> bool:
+    data = read_json(path)
+    return bool(data and data.get("segments"))
 
 
 def hydrate_from_matching_source(current_session_path: str, source_path: str) -> Optional[str]:
@@ -87,3 +103,29 @@ def hydrate_from_matching_source(current_session_path: str, source_path: str) ->
             return candidate_dir
 
     return None
+
+
+def hydrate_latest_transcript(current_session_path: str) -> Optional[str]:
+    sessions_root = os.path.join(local_output_dir(), "sessions")
+    if not os.path.isdir(sessions_root):
+        return None
+    dst = os.path.join(current_session_path, "transcript.json")
+    if os.path.exists(dst):
+        return None
+
+    candidates = []
+    for name in os.listdir(sessions_root):
+        candidate_dir = os.path.join(sessions_root, name)
+        if not os.path.isdir(candidate_dir) or os.path.abspath(candidate_dir) == os.path.abspath(current_session_path):
+            continue
+        transcript_path = os.path.join(candidate_dir, "transcript.json")
+        if _valid_transcript(transcript_path):
+            candidates.append((os.path.getmtime(transcript_path), name, transcript_path))
+
+    if not candidates:
+        return None
+    _mtime, name, transcript_path = sorted(candidates, reverse=True)[0]
+    os.makedirs(current_session_path, exist_ok=True)
+    shutil.copy2(transcript_path, dst)
+    print(f"[resume] reused latest transcript from session {name}", flush=True)
+    return transcript_path

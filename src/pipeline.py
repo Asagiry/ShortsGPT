@@ -214,7 +214,7 @@ def generate_shorts(
     from .local.llm import call_openai_llm
     from .local.media_analysis import build_analysis_map, score_highlights
     from .local.progress import stage, user_log
-    from .local.session import hydrate_from_matching_source, read_json, session_dir, write_json
+    from .local.session import hydrate_from_matching_source, hydrate_latest_transcript, read_json, session_dir, write_json
     from .local.transcriber import transcribe_local
 
     output_dir = local_output_dir()
@@ -245,7 +245,9 @@ def generate_shorts(
         source_path = download_youtube_local(video_url, fmt=download_format)
         write_json(source_json, {"path": source_path})
 
-    hydrate_from_matching_source(session_path, source_path)
+    hydrated_session = hydrate_from_matching_source(session_path, source_path)
+    if not hydrated_session:
+        hydrate_latest_transcript(session_path)
 
     transcript = read_json(transcript_json)
     if transcript:
