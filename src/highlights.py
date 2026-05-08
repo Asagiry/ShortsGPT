@@ -23,7 +23,7 @@ from .local.session import read_json, write_json
 LLMFn = Callable[[str], str]
 
 MIN_POSTABLE_SCORE = 78
-HIGHLIGHT_SELECTION_VERSION = 3
+HIGHLIGHT_SELECTION_VERSION = 4
 FINAL_QUALITY_REVIEW_VERSION = 3
 
 
@@ -448,6 +448,58 @@ def _parse_beats(data: Dict) -> List[Dict]:
             "boundary_note": str(beat.get("boundary_note", "")),
         })
     return beats
+
+
+def _fallback_highlights_from_beats(beats: List[Dict], num_clips: int, reason: str = "LLM returned zero candidates") -> List[Dict]:
+    fallback: List[Dict] = []
+    ranked = sorted(
+        beats,
+        key=lambda b: (
+            int(b.get("clip_potential", 0) or 0),
+            1 if b.get("standalone") else 0,
+            float(b.get("end_time", 0.0)) - float(b.get("start_time", 0.0)),
+        ),
+        reverse=True,
+    )
+    for beat in ranked:
+        try:
+            start = float(beat.get("start_time", 0.0))
+            end = float(beat.get("end_time", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        if end - start < 10.0:
+            end = start + 10.0
+        if end - start > 75.0:
+            end = start + 75.0
+        potential = int(beat.get("clip_potential", 0) or 0)
+        score = max(68, min(88, potential if potential else 72))
+        title = _compact_text(str(beat.get("summary") or beat.get("payoff") or "Episode moment"), 70)
+        fallback.append({
+            "title": title,
+            "start_time": start,
+            "end_time": end,
+            "score": score,
+            "viral_score": score,
+            "hook_sentence": _compact_text(str(beat.get("setup") or title), 120),
+            "virality_reason": f"{reason}; kept from story beat: {_compact_text(str(beat.get('payoff') or beat.get('summary') or ''), 180)}",
+            "semantic_key": _compact_text(str(beat.get("summary") or title).casefold(), 90),
+            "score_matrix": {
+                "hook": score,
+                "first_3s": max(60, score - 5),
+                "standalone_clarity": 70 if beat.get("standalone") else 60,
+                "setup_completeness": 70,
+                "payoff_strength": max(62, score - 4),
+                "ending_completeness": 70,
+                "shareability": max(58, score - 8),
+                "rewatch_potential": 58,
+                "context_loss_risk": 35 if beat.get("standalone") else 55,
+            },
+        })
+        if len(fallback) >= max(1, min(num_clips, 4)):
+            break
+    return fallback
 
 
 def build_transcript_sample(transcript: Dict, max_chars: int = 14000) -> str:
@@ -913,6 +965,13 @@ def call_highlight_api_from_beats(
         min_shareability=35,
     )
     if not candidates:
+        candidates = _fallback_highlights_from_beats(
+            sorted_beats,
+            num_clips,
+            reason="LLM candidate batches returned zero usable clips",
+        )
+        user_log("GPT clip candidates", f"LLM returned 0 usable candidates; using {len(candidates)} best story beats")
+    if not candidates:
         result = {"version": HIGHLIGHT_SELECTION_VERSION, "highlights": [], "complete": True, "batches": completed_batches}
         if cache_path:
             write_json(cache_path, result)
@@ -953,6 +1012,9 @@ def call_highlight_api_from_beats(
             h["virality_reason"] = str(item["reason"])
         if int(h.get("score", 0) or 0) >= 65:
             selected.append(h)
+    if not selected:
+        selected = top_candidates[: max(1, min(num_clips, 4))]
+        user_log("LLM final review", f"returned 0 clips; using {len(selected)} best candidates instead")
     result = {
         "version": HIGHLIGHT_SELECTION_VERSION,
         "highlights": keep_postable_highlights(
@@ -1400,7 +1462,12 @@ def get_highlights(
         )
         highlights = dedupe_highlights(result.get("highlights", []))
         if not highlights:
-            raise RuntimeError("Beat-map selection returned zero clips.")
+            highlights = _fallback_highlights_from_beats(
+                beat_map.get("beats", []),
+                num_clips,
+                reason="Beat-map selection returned zero clips",
+            )
+            user_log("Beat map selection", f"using {len(highlights)} fallback clips from best story beats")
         return {"highlights": highlights, "beat_map_source": beat_map.get("source")}
 
     if duration >= LONG_VIDEO_THRESHOLD:
