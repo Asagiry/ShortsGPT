@@ -864,6 +864,93 @@ def keep_postable_highlights(
     return kept
 
 
+def refine_highlight_boundaries_with_llm(
+    transcript: Dict,
+    highlights: List[Dict],
+    llm_fn: LLMFn,
+) -> List[Dict]:
+    if not highlights:
+        return []
+
+    segments = transcript.get("segments", [])
+    review_items = []
+    for index, h in enumerate(highlights, 1):
+        start = float(h.get("start_time", 0.0))
+        end = float(h.get("end_time", 0.0))
+        context_segments = []
+        for segment in segments:
+            seg_start = float(segment.get("start", 0.0))
+            seg_end = float(segment.get("end", 0.0))
+            if seg_end < start - 14.0 or seg_start > end + 22.0:
+                continue
+            text = str(segment.get("text", "")).strip()
+            if text:
+                context_segments.append({
+                    "start": round(seg_start, 2),
+                    "end": round(seg_end, 2),
+                    "text": text,
+                })
+        review_items.append({
+            "id": index,
+            "title": h.get("title", ""),
+            "current_start": round(start, 2),
+            "current_end": round(end, 2),
+            "score": int(h.get("score", 0) or 0),
+            "reason": h.get("virality_reason", ""),
+            "context_segments": context_segments[:42],
+        })
+
+    prompt = f"""You are a semantic boundary editor for short-form clips from a scripted episode.
+
+The clips are already selected. Do NOT replace them with different scenes.
+Your only job is to adjust start_time/end_time so each clip is a complete mini-scene.
+
+Rules:
+- Keep the selected idea, but include the necessary setup, turn, payoff, final answer, reaction, or visual/silent landing.
+- Do not end just because speech pauses; end when the meaning of the scene beat has landed.
+- Do not cut mid-thought, before the punchline/rebuttal/answer, or before the reaction that makes the joke work.
+- Remove unrelated lead-in/outro only when it is clearly outside the selected beat.
+- Aim for 18-60 seconds. Use up to 75 seconds when needed for a complete ending.
+- If a candidate cannot be made complete from the given context, set keep=false.
+- Put boundaries on transcript segment boundaries when possible.
+
+Respond JSON only:
+{{"clips":[{{"id":int,"keep":true,"start_time":float,"end_time":float,"reason":"short boundary reason"}}]}}
+
+Candidates:
+{json.dumps(review_items, ensure_ascii=False, separators=(",", ":"))[:24000]}
+"""
+    user_log("Semantic boundary review", f"adjusting {len(review_items)} selected clips")
+    data = _parse_json_loose(llm_fn(prompt))
+    by_id = {i + 1: h for i, h in enumerate(highlights)}
+    refined = []
+    for item in data.get("clips", []):
+        try:
+            cid = int(item.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cid not in by_id or item.get("keep") is False:
+            continue
+        h = dict(by_id[cid])
+        try:
+            start = float(item.get("start_time", h.get("start_time", 0.0)))
+            end = float(item.get("end_time", h.get("end_time", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        h["start_time"] = start
+        h["end_time"] = end
+        if item.get("reason"):
+            h["boundary_reason"] = str(item.get("reason"))
+        refined.append(h)
+    if not refined:
+        user_log("Semantic boundary review", "kept original boundaries")
+        return highlights
+    user_log("Semantic boundary review", f"{len(refined)} clips adjusted/kept")
+    return refined
+
+
 def verify_highlights_with_llm(
     transcript: Dict,
     candidates: List[Dict],

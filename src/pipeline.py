@@ -8,7 +8,7 @@ import shutil
 from typing import Dict, List, Optional
 
 from .config import edit_profile, local_output_dir
-from .highlights import build_beat_map, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights
+from .highlights import build_beat_map, decide_auto_clip_count, decide_edit_plan, get_highlights, keep_postable_highlights, refine_highlight_boundaries_with_llm
 
 
 def _snap_highlights_to_segments(highlights: List[Dict], transcript: Dict) -> List[Dict]:
@@ -66,6 +66,7 @@ def _extend_to_natural_ending(segments: List[Dict], last_segment: Dict, original
 
 TARGET_CLIP_SECONDS = 60.0
 MAX_CLIP_SECONDS = 75.0
+BOUNDARY_REVIEW_VERSION = 2
 
 
 def _has_natural_pause_after(segments: List[Dict], index: int, duration: float) -> bool:
@@ -466,7 +467,7 @@ def generate_shorts(
     verified_top = verified_top_state.get("highlights") if verified_top_state else None
     if verified_top and (
         len(verified_top) >= num_clips or verified_top_state.get("quality_limited") is True
-    ):
+    ) and verified_top_state.get("boundary_review_version") == BOUNDARY_REVIEW_VERSION:
         top = verified_top[:num_clips]
         user_log("Final picks ready", f"{len(top)} clips loaded from cache")
     else:
@@ -481,10 +482,15 @@ def generate_shorts(
                 analysis_map,
             )[:num_clips]
             write_json(top_json, {"highlights": top})
-        stage("Checking clip boundaries", f"expanding {len(top)} clips to clean phrase endings")
+        stage("Checking clip boundaries", f"LLM adjusts {len(top)} clips to semantic scene endings")
+        top = refine_highlight_boundaries_with_llm(transcript, top, call_fast_llm)
         top = _snap_highlights_to_segments(top, transcript)
         top = keep_postable_highlights(_enforce_duration_cap(top, transcript))
-        write_json(verified_top_json, {"highlights": top, "quality_limited": len(top) < num_clips})
+        write_json(verified_top_json, {
+            "highlights": top,
+            "quality_limited": len(top) < num_clips,
+            "boundary_review_version": BOUNDARY_REVIEW_VERSION,
+        })
     if not top:
         user_log("No strong clips", "Final quality check rejected every candidate")
         result = {
