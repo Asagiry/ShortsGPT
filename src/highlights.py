@@ -12,6 +12,8 @@ drive any OpenAI-compatible API.
 import json
 import re
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional
 
 from .local.progress import Progress, user_log
@@ -486,6 +488,14 @@ def _partial_batches(existing: Optional[Dict]) -> Dict[int, Dict]:
     return {int(item.get("index", 0)): item for item in batches if int(item.get("index", 0) or 0) > 0}
 
 
+def _llm_parallelism(total_items: int) -> int:
+    try:
+        configured = int(os.getenv("LLM_PARALLELISM", "2"))
+    except ValueError:
+        configured = 2
+    return max(1, min(total_items, configured, 4))
+
+
 def _write_partial_beat_map(cache_path: Optional[str], chunks: List[Dict], complete: bool = False) -> None:
     if not cache_path:
         return
@@ -542,24 +552,21 @@ def build_beat_map(
             force=True,
         )
 
-    for chunk in chunk_plan:
+    pending_chunks = [chunk for chunk in chunk_plan if int(chunk["index"]) not in completed_by_index]
+
+    def analyze_chunk(chunk: Dict) -> Dict:
         chunk_index = int(chunk["index"])
         start = float(chunk["start"])
         end = float(chunk["end"])
-        if chunk_index in completed_by_index:
-            continue
         text = _transcript_text_for_window(transcript, start, end)
         if not text.strip():
-            progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: no speech", force=True)
-            completed_chunks.append({
+            return {
                 "index": chunk_index,
                 "start": start,
                 "end": end,
                 "beats": [],
                 "skipped": "no speech",
-            })
-            _write_partial_beat_map(cache_path, completed_chunks, complete=False)
-            continue
+            }
         analysis_json = json.dumps(
             _analysis_for_window(analysis_map, start, end),
             ensure_ascii=False,
@@ -571,22 +578,46 @@ def build_beat_map(
             f"Local media analysis for this window:\n{analysis_json}\n\n"
             f"Timestamped transcript window:\n{text[:18000]}"
         )
+        user_log(
+            "GPT story map",
+            f"reading transcript chunk {chunk_index}/{total_chunks} ({start:.0f}s-{end:.0f}s)",
+        )
         try:
-            user_log("LLM story beats", f"chunk {chunk_index}/{total_chunks}, {start:.0f}s-{end:.0f}s")
             raw = llm_fn(prompt)
             beats = _parse_beats(_parse_json_loose(raw))
-            progress.update(chunk_index, f"chunk {chunk_index}/{total_chunks}: {len(beats)} beats", force=True)
-            completed_chunks.append({
-                "index": chunk_index,
-                "start": start,
-                "end": end,
-                "beats": beats,
-            })
-            _write_partial_beat_map(cache_path, completed_chunks, complete=False)
         except Exception as e:
             raise RuntimeError(
                 f"Story beat analysis failed on chunk {chunk_index} ({start:.0f}s-{end:.0f}s): {e}"
             ) from e
+        return {
+            "index": chunk_index,
+            "start": start,
+            "end": end,
+            "beats": beats,
+        }
+
+    workers = _llm_parallelism(len(pending_chunks))
+    if pending_chunks:
+        user_log(
+            "GPT story map",
+            f"{len(pending_chunks)} chunks left, {workers} request{'s' if workers != 1 else ''} in parallel",
+        )
+    if workers <= 1:
+        for chunk in pending_chunks:
+            result = analyze_chunk(chunk)
+            completed_chunks.append(result)
+            detail = "no speech" if result.get("skipped") else f"{len(result.get('beats', []))} beats"
+            progress.update(int(result["index"]), f"chunk {int(result['index'])}/{total_chunks}: {detail}", force=True)
+            _write_partial_beat_map(cache_path, completed_chunks, complete=False)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(analyze_chunk, chunk): chunk for chunk in pending_chunks}
+            for future in as_completed(futures):
+                result = future.result()
+                completed_chunks.append(result)
+                detail = "no speech" if result.get("skipped") else f"{len(result.get('beats', []))} beats"
+                progress.update(int(result["index"]), f"chunk {int(result['index'])}/{total_chunks}: {detail}", force=True)
+                _write_partial_beat_map(cache_path, completed_chunks, complete=False)
 
     all_beats: List[Dict] = []
     for chunk in completed_chunks:
@@ -676,12 +707,19 @@ def call_highlight_api_from_beats(
     progress = Progress("LLM candidates", total_batches)
     for done_index in sorted(completed_by_index):
         progress.update(done_index, f"batch {done_index}/{total_batches}: cached", force=True)
+
+    batch_plan = []
     for batch_index, offset in enumerate(range(0, len(sorted_beats), BEAT_SELECT_BATCH_SIZE), 1):
         batch = sorted_beats[offset: offset + BEAT_SELECT_BATCH_SIZE]
         if not batch:
             continue
         if batch_index in completed_by_index:
             continue
+        batch_plan.append({"index": batch_index, "beats": batch})
+
+    def analyze_batch(item: Dict) -> Dict:
+        batch_index = int(item["index"])
+        batch = item["beats"]
         batch_json = json.dumps({"beats": batch}, ensure_ascii=False, separators=(",", ":"))[:14000]
         prompt = BEAT_HIGHLIGHT_PROMPT.format(
             virality_criteria=VIRALITY_CRITERIA,
@@ -691,18 +729,40 @@ def call_highlight_api_from_beats(
             beat_map_json=batch_json,
         )
         try:
-            user_log("LLM candidates", f"batch {batch_index}/{total_batches}, reviewing {len(batch)} beats")
+            user_log("GPT clip candidates", f"batch {batch_index}/{total_batches}, reviewing {len(batch)} story beats")
             result = _parse_json_loose(llm_fn(prompt))
             batch_candidates = result.get("highlights", [])
-            candidates.extend(batch_candidates)
-            progress.update(batch_index, f"batch {batch_index}/{total_batches}: {len(batch_candidates)} candidates", force=True)
-            completed_batches.append({
+            return {
                 "index": batch_index,
                 "highlights": batch_candidates,
-            })
-            _write_partial_highlights(cache_path, completed_batches, complete=False)
+            }
         except Exception as e:
             raise RuntimeError(f"Candidate selection failed on beat batch {batch_index}: {e}") from e
+
+    workers = _llm_parallelism(len(batch_plan))
+    if batch_plan:
+        user_log(
+            "GPT clip candidates",
+            f"{len(batch_plan)} batches left, {workers} request{'s' if workers != 1 else ''} in parallel",
+        )
+    if workers <= 1:
+        for item in batch_plan:
+            result = analyze_batch(item)
+            batch_candidates = result.get("highlights", [])
+            candidates.extend(batch_candidates)
+            completed_batches.append(result)
+            progress.update(int(result["index"]), f"batch {int(result['index'])}/{total_batches}: {len(batch_candidates)} candidates", force=True)
+            _write_partial_highlights(cache_path, completed_batches, complete=False)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(analyze_batch, item): item for item in batch_plan}
+            for future in as_completed(futures):
+                result = future.result()
+                batch_candidates = result.get("highlights", [])
+                candidates.extend(batch_candidates)
+                completed_batches.append(result)
+                progress.update(int(result["index"]), f"batch {int(result['index'])}/{total_batches}: {len(batch_candidates)} candidates", force=True)
+                _write_partial_highlights(cache_path, completed_batches, complete=False)
 
     candidates = keep_postable_highlights(dedupe_highlights(candidates), min_score=MIN_POSTABLE_SCORE - 3)
     if not candidates:

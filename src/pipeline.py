@@ -309,7 +309,7 @@ def generate_shorts(
             write_json(result_json, result)
             return result
 
-    stage("Finding story beats", "grouping the episode into complete jokes/scenes/ideas")
+    stage("GPT story mapping", "reading transcript chunks and finding complete jokes/scenes/ideas")
     beat_map = read_json(beat_map_json)
     if beat_map and beat_map.get("complete") and beat_map.get("beats"):
         user_log("Story beats ready", f"{len(beat_map.get('beats', []))} beats loaded from cache")
@@ -326,7 +326,7 @@ def generate_shorts(
         write_json(beat_map_json, beat_map)
         user_log("Story beats ready", f"{len(beat_map.get('beats', []))} complete beats found")
 
-    stage("Choosing candidate shorts", "ranking beats by hook, payoff, audio energy, and scene flow")
+    stage("GPT clip selection", "ranking story beats by hook, payoff, audio energy, and scene flow")
     highlights_result = read_json(highlights_json)
     if highlights_result and highlights_result.get("complete"):
         user_log("Candidates ready", f"{len(highlights_result.get('highlights', []))} candidates loaded from cache")
